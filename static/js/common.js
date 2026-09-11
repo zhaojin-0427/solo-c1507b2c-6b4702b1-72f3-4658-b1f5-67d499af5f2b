@@ -109,13 +109,17 @@ function regionMaxDisplacement(region, block) {
 
 /* ---------------- 画布 ---------------- */
 
-/* 在指定 canvas 上建立 mm→px 的坐标系;返回 {ctx, scale, ox, oy} */
+/* 在指定 canvas 上建立 mm→px 的坐标系;返回 {ctx, scale, ox, oy}
+   容器不可见(页签隐藏)时 clientWidth 为 0,须给尺寸下限,
+   否则负缩放会让 canvas.width 赋负值抛异常、中断全部重绘。 */
 function setupCanvas(canvas, maxW, maxH) {
   const { w, h } = paperSize();
+  maxW = Math.max(120, maxW || 0);
+  maxH = Math.max(120, maxH || 0);
   const scale = Math.min(maxW / w, maxH / h);
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.ceil(w * scale * dpr) + 2;
-  canvas.height = Math.ceil(h * scale * dpr) + 2;
+  canvas.width = Math.max(1, Math.ceil(w * scale * dpr) + 2);
+  canvas.height = Math.max(1, Math.ceil(h * scale * dpr) + 2);
   canvas.style.width = Math.ceil(w * scale) + "px";
   canvas.style.height = Math.ceil(h * scale) + "px";
   const ctx = canvas.getContext("2d");
@@ -204,6 +208,10 @@ function canvasMm(canvas, view, evt) {
   return pxToMm(view, evt.clientX - r.left, evt.clientY - r.top);
 }
 
-/* 刷新所有画布(各 tab 的重绘函数由各自模块注册) */
+/* 刷新所有画布;单个画布出错(如隐藏页签尺寸异常)不影响其余 */
 const Redraw = {};
-function redrawAll() { Object.values(Redraw).forEach(fn => fn()); }
+function redrawAll() {
+  Object.entries(Redraw).forEach(([name, fn]) => {
+    try { fn(); } catch (e) { console.error(`重绘 ${name} 失败:`, e); }
+  });
+}

@@ -414,58 +414,60 @@ def list_trials(pid):
 
 # ---------------------------------------------------------------- 版序枚举 API
 
-def rasterize_overlaps(blocks, paper_w, paper_h):
-    """把各版(含当前偏移/旋转)的区域栅格化,返回版间重叠像素数矩阵与覆盖计数。"""
+def rasterize_pair_errors(blocks, paper_w, paper_h):
+    """栅格化各版区域(含当前偏移/旋转),返回 pair_err[top][bottom]:
+    在两版重叠的像素上,top 版油墨叠到 bottom 版之上的混合色与
+    top 版*该区域目标色*(区域级,缺省回落到版级)的距离 × 面积。"""
     n = len(blocks)
     W = 140
     H = max(1, round(W * paper_h / paper_w))
     cw, ch = paper_w / W, paper_h / H
+    cell_area = cw * ch
     cx, cy = paper_w / 2, paper_h / 2
-    # 每版变换后的多边形列表
+    inks = [hex_to_rgb(b["ink_color"]) for b in blocks]
+    alphas = [b["opacity"] for b in blocks]
+    # 每版:变换后的 [(多边形, 该区域目标色rgb)]
     polys = []
     for b in blocks:
         lst = []
         for r in b["regions"]:
-            lst.append([transform_point(p[0], p[1], cx, cy,
-                                        b["offset_x"], b["offset_y"], b["rotation"])
-                        for p in r["points"]])
+            tgt = hex_to_rgb(r["target_color"] or b["target_color"])
+            pts = [transform_point(p[0], p[1], cx, cy,
+                                   b["offset_x"], b["offset_y"], b["rotation"])
+                   for p in r["points"]]
+            lst.append((pts, tgt))
         polys.append(lst)
-    overlap = [[0] * n for _ in range(n)]
+    pair_err = [[0.0] * n for _ in range(n)]
     for gy in range(H):
         y = (gy + 0.5) * ch
         for gx in range(W):
             x = (gx + 0.5) * cw
-            covering = []
+            covering = []  # [(版序号, 该区域目标色rgb)]
             for i in range(n):
-                for poly in polys[i]:
-                    if point_in_poly(x, y, poly):
-                        covering.append(i)
+                for pts, tgt in polys[i]:
+                    if point_in_poly(x, y, pts):
+                        covering.append((i, tgt))
                         break
-            for a, bidx in itertools.combinations(covering, 2):
-                overlap[a][bidx] += 1
-                overlap[bidx][a] += 1
-    cell_area = cw * ch
-    return [[overlap[i][j] * cell_area for j in range(n)] for i in range(n)]
+            for t in range(len(covering)):
+                j, tgt_j = covering[t]
+                aj = alphas[j]
+                ink_j = inks[j]
+                for u in range(len(covering)):
+                    if u == t:
+                        continue
+                    i = covering[u][0]
+                    ink_i = inks[i]
+                    mixed = tuple(aj * ink_j[k] + (1 - aj) * ink_i[k] for k in range(3))
+                    pair_err[j][i] += math.dist(mixed, tgt_j) * cell_area
+    return pair_err
 
 
-def order_metrics(order, overlap, idx):
+def order_metrics(order, pair_err, blocks):
     """order: block 下标序列。返回 (混色误差, 换色次数, 干燥等待次数)。"""
-    blocks = order_metrics.blocks
     color_err = 0.0
     for later in range(1, len(order)):
-        bj = blocks[order[later]]
-        aj = bj["opacity"]
-        ink_j = hex_to_rgb(bj["ink_color"])
-        tgt_j = hex_to_rgb(bj["target_color"])
         for earlier in range(later):
-            bi = blocks[order[earlier]]
-            area = overlap[idx[order[earlier]]][idx[order[later]]]
-            if area <= 0:
-                continue
-            ink_i = hex_to_rgb(bi["ink_color"])
-            mixed = tuple(aj * ink_j[k] + (1 - aj) * ink_i[k] for k in range(3))
-            err = math.sqrt(sum((mixed[k] - tgt_j[k]) ** 2 for k in range(3)))
-            color_err += err * area
+            color_err += pair_err[order[later]][order[earlier]]
     ink_changes = sum(
         1 for k in range(1, len(order))
         if blocks[order[k]]["ink_color"].lower() != blocks[order[k - 1]]["ink_color"].lower())
@@ -485,15 +487,13 @@ def enumerate_orders(pid):
     pw, ph = proj["paper_w"], proj["paper_h"]
     if proj["orientation"] == "landscape":
         pw, ph = ph, pw
-    overlap = rasterize_overlaps(blocks, pw, ph)
-    idx = list(range(n))
+    pair_err = rasterize_pair_errors(blocks, pw, ph)
 
     # blocks 已按 seq 排序;锁定的版固定在当前的印次位置,其余版排列其余位置
     locked = {i: i for i, b in enumerate(blocks) if b["locked_position"]}
     free_pos = [p for p in range(n) if p not in locked]
     free_blocks = [i for i in range(n) if i not in locked.values()]
 
-    order_metrics.blocks = blocks
     results = []
     for perm in itertools.permutations(free_blocks):
         order = [None] * n
@@ -504,7 +504,7 @@ def enumerate_orders(pid):
             order[pos] = bi
         if any(v is None for v in order):
             continue
-        ce, ic, dw = order_metrics(order, overlap, idx)
+        ce, ic, dw = order_metrics(order, pair_err, blocks)
         results.append({
             "order": [blocks[i]["id"] for i in order],
             "names": [blocks[i]["name"] for i in order],

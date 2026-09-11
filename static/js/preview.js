@@ -37,7 +37,8 @@ Redraw.preview = redrawPreview;
 
 /* ---------------- 检测 ---------------- */
 
-const ANALYSIS_SCALE = 1.2; // px/mm
+const ANALYSIS_SCALE = 3;   // px/mm(兼顾精度与速度)
+const MASK_ALPHA = 128;     // 掩码二值化阈值,排除抗锯齿边缘毛刺
 
 function runDetection() {
   const { w: PW, h: PH } = paperSize();
@@ -46,7 +47,7 @@ function runDetection() {
   const blocks = blocksSorted();
   const issues = [];
 
-  // 每版栅格化掩码(含当前偏移/旋转)
+  // 每版栅格化掩码(含当前偏移/旋转),α≥128 才算覆盖
   const masks = blocks.map(b => {
     const cv = document.createElement("canvas");
     cv.width = W; cv.height = H;
@@ -62,7 +63,7 @@ function runDetection() {
     });
     const d = c.getImageData(0, 0, W, H).data;
     const m = new Uint8Array(N);
-    for (let i = 0; i < N; i++) m[i] = d[i * 4 + 3] > 0 ? 1 : 0;
+    for (let i = 0; i < N; i++) m[i] = d[i * 4 + 3] >= MASK_ALPHA ? 1 : 0;
     return m;
   });
 
@@ -80,7 +81,7 @@ function runDetection() {
     });
     c.closePath(); c.fill();
     const d = c.getImageData(0, 0, W, H).data;
-    for (let i = 0; i < N; i++) if (d[i * 4 + 3] > 0) expected[i] = 1;
+    for (let i = 0; i < N; i++) if (d[i * 4 + 3] >= MASK_ALPHA) expected[i] = 1;
   }));
 
   // 合成颜色 + 覆盖计数
@@ -118,25 +119,33 @@ function runDetection() {
     type: "gap", text: `露白:约 ${(gapCount * mm2).toFixed(1)} mm² 应有墨色处露出纸面(色版偏移或区域缺失)`,
   });
 
-  // ② 非预期叠色:≥2 版覆盖且混合色与所有相关目标色都偏差过大
+  // ② 非预期叠色:≥2 版覆盖且混合色与任一相关目标色都偏差过大
+  // 每版的目标色集合(版级 + 区域级)预解析为 rgb,避免逐像素解析 hex
+  const blockTargets = blocks.map(b => {
+    const hexes = [b.target_color];
+    b.regions.forEach(r => { if (r.target_color) hexes.push(r.target_color); });
+    return hexes.map(hexToRgb);
+  });
   let overCount = 0;
   const TH = 60;
   for (let i = 0; i < N; i++) {
     if (coverCount[i] < 2) continue;
-    const finalHex = rgbToHex(comp[i*3], comp[i*3+1], comp[i*3+2]);
+    const fr = comp[i*3], fg = comp[i*3+1], fb = comp[i*3+2];
     let minD = Infinity;
-    blocks.forEach((b, bi) => {
-      if (!masks[bi][i]) return;
-      minD = Math.min(minD, colorDist(finalHex, b.target_color));
-      b.regions.forEach(r => { if (r.target_color) minD = Math.min(minD, colorDist(finalHex, r.target_color)); });
-    });
+    for (let bi = 0; bi < blocks.length; bi++) {
+      if (!masks[bi][i]) continue;
+      for (const t of blockTargets[bi]) {
+        const d = Math.sqrt((fr-t[0])**2 + (fg-t[1])**2 + (fb-t[2])**2);
+        if (d < minD) minD = d;
+      }
+    }
     if (minD > TH) { overCount++; mark(i, 150, 40, 200); }
   }
   if (overCount) issues.push({
     type: "overprint", text: `非预期叠色:约 ${(overCount * mm2).toFixed(1)} mm² 叠印结果与任一目标色均不符`,
   });
 
-  // ③ 过窄线条:开运算后消失的部分
+  // ③ 过窄线条:开运算(8 邻域)后消失的部分,即局部宽度不足 min_line_width
   blocks.forEach((b, bi) => {
     const r = Math.max(1, Math.round(b.min_line_width / 2 * ANALYSIS_SCALE));
     const opened = morphOpen(masks[bi], W, H, r);
@@ -174,20 +183,24 @@ function morphOpen(mask, W, H, r) {
   for (let k = 0; k < r; k++) cur = morphStep(cur, W, H, true);
   return cur;
 }
+/* 8 邻域腐蚀/膨胀:矩形等宽面经开运算后保持原形,角点不会被误报 */
 function morphStep(src, W, H, dilate) {
   const out = new Uint8Array(src.length);
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
-      if (dilate) {
-        out[i] = (src[i] ||
-          (x > 0 && src[i-1]) || (x < W-1 && src[i+1]) ||
-          (y > 0 && src[i-W]) || (y < H-1 && src[i+W])) ? 1 : 0;
-      } else {
-        out[i] = (src[i] &&
-          (x > 0 && src[i-1]) && (x < W-1 && src[i+1]) &&
-          (y > 0 && src[i-W]) && (y < H-1 && src[i+W])) ? 1 : 0;
+      let v = dilate ? src[i] : 1;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy) continue;
+          const nx = x + dx, ny = y + dy;
+          const inside = nx >= 0 && nx < W && ny >= 0 && ny < H;
+          const nb = inside ? src[ny * W + nx] : 0;
+          if (dilate) { if (nb) { v = 1; dy = 2; break; } }
+          else if (!nb) { v = 0; dy = 2; break; }
+        }
       }
+      out[i] = v;
     }
   }
   return out;

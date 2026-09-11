@@ -66,6 +66,16 @@ function redrawTrial() {
     ctx.fillText(`拾取模式:请点击第 ${pickIdx + 1} 个标记的设计位置`, 12, 20);
     ctx.restore();
   }
+  if (App.trialOverlay && App.trialCorr) {
+    const ctx = trialView.ctx;
+    ctx.save();
+    ctx.font = "12px sans-serif";
+    ctx.fillStyle = "#2e7d32";
+    ctx.fillText("—— 设计轮廓(修正后目标)", 12, 20);
+    ctx.fillStyle = "#d32f2f";
+    ctx.fillText("- - 实测偏差轮廓(修正前)", 12, 36);
+    ctx.restore();
+  }
 }
 Redraw.trial = redrawTrial;
 
@@ -91,9 +101,10 @@ async function solveTrial() {
 function showTrialResult(c) {
   const el = $("#trial-result");
   el.style.display = "block";
-  el.innerHTML = `<b>修正量</b> —— 平移 (${c.tx.toFixed(2)}, ${c.ty.toFixed(2)}) mm ·
+  el.innerHTML = `<b>实测偏差</b> —— 平移 (${c.tx.toFixed(2)}, ${c.ty.toFixed(2)}) mm ·
     旋转 ${c.rot_deg.toFixed(3)}° · 缩放 ${(c.scale * 100).toFixed(2)}% ·
-    残差 RMS ${c.rms_error.toFixed(3)} mm` +
+    残差 RMS ${c.rms_error.toFixed(3)} mm<br>
+    <span class="tag">「应用修正」将按<b>逆变换</b>抵消该偏差(缩放仅提示,物理版无法缩放)。</span>` +
     (Math.abs(c.scale - 1) > 0.005
       ? `<br><span style="color:#b00020">⚠ 缩放偏差超过 0.5%,可能是纸张伸缩或测量误差,建议重印试样。</span>` : "");
 }
@@ -103,15 +114,31 @@ async function applyCorrection() {
   if (!b) return;
   if (!App.trialCorr) { toast("请先解算修正", true); return; }
   if (b.locked_correction) { toast("该版修正已锁定,请先解除锁定", true); return; }
-  // 平移+旋转写入色版;缩放仅提示(物理版无法缩放)
-  b.offset_x = +App.trialCorr.tx.toFixed(2);
-  b.offset_y = +App.trialCorr.ty.toFixed(2);
-  b.rotation = +App.trialCorr.rot_deg.toFixed(3);
+  // trialCorr 是「设计→实测」的误差变换 T(p)=s·R(θ)p+t;要抵消它,色版新变换
+  // 必须是 T⁻¹∘旧变换。色版变换为 绕纸心旋转β后平移d,即 p→R(β)p+u,
+  // 其中 u = c − R(β)c + d。精确合成:
+  //   β' = β − θ,  u' = (1/s)·R(−θ)·(u − t),  再解回 d'。
+  // 物理版无法缩放,旋转部分不带 1/s(缩放偏差已在结果中提示)。
+  const c = App.trialCorr;
+  const { w, h } = paperSize();
+  const cx = w / 2, cy = h / 2;
+  const th = c.rot_deg * Math.PI / 180;
+  const invS = 1 / (c.scale || 1);
+  const b0 = b.rotation * Math.PI / 180;
+  const ux = cx - (Math.cos(b0) * cx - Math.sin(b0) * cy) + b.offset_x;
+  const uy = cy - (Math.sin(b0) * cx + Math.cos(b0) * cy) + b.offset_y;
+  const vx = ux - c.tx, vy = uy - c.ty;
+  const unx = invS * (Math.cos(th) * vx + Math.sin(th) * vy);
+  const uny = invS * (-Math.sin(th) * vx + Math.cos(th) * vy);
+  const bn = (b.rotation - c.rot_deg) * Math.PI / 180;
+  b.offset_x = +(unx - cx + (Math.cos(bn) * cx - Math.sin(bn) * cy)).toFixed(2);
+  b.offset_y = +(uny - cy + (Math.sin(bn) * cx + Math.cos(bn) * cy)).toFixed(2);
+  b.rotation = +(b.rotation - c.rot_deg).toFixed(3);
   try {
     App.project = await api(`/api/blocks/${b.id}`, "PUT", {
       offset_x: b.offset_x, offset_y: b.offset_y, rotation: b.rotation,
     });
-    toast("修正已应用到该版(缩放部分请核对纸张)");
+    toast(`已按逆变换抵消偏差:偏移 (${b.offset_x}, ${b.offset_y}) mm,旋转 ${b.rotation}°`);
     refreshAllPanels();
   } catch (e) { toast(e.message, true); }
 }
