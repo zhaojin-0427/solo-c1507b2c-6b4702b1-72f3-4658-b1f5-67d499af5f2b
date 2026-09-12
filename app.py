@@ -6,12 +6,17 @@
   * 试印校准:由三对(设计坐标, 实测坐标)最小二乘解算 平移+旋转+统一缩放
   * 版序枚举:锁定部分版的位置,枚举剩余排列,按 混色误差 / 清墨换色次数 / 干燥等待次数 排序
   * 方案与试印记录持久化到 SQLite
+  * 减版木刻流程:同一块实体木版的连续刻印阶段,阶段差分(保留凸面/刻除区)
+    在后端栅格化计算并写入 SQLite
 """
+import base64
+import binascii
 import json
 import math
 import os
 import sqlite3
 import itertools
+import zlib
 
 from flask import Flask, g, jsonify, render_template, request, abort
 
@@ -69,6 +74,45 @@ CREATE TABLE IF NOT EXISTS plans (
   metrics TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
+CREATE TABLE IF NOT EXISTS reduction_flows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source_block_id INTEGER REFERENCES blocks(id) ON DELETE SET NULL,
+  name TEXT NOT NULL,
+  paper_w REAL NOT NULL,
+  paper_h REAL NOT NULL,
+  grid_w INTEGER NOT NULL,
+  grid_h INTEGER NOT NULL,
+  scale REAL NOT NULL,
+  reg_marks TEXT NOT NULL DEFAULT '[]',
+  snapshot TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS reduction_stages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  flow_id INTEGER NOT NULL REFERENCES reduction_flows(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  carve_polys TEXT NOT NULL DEFAULT '[]',
+  zone_ids TEXT NOT NULL DEFAULT '[]',
+  ink_color TEXT NOT NULL DEFAULT '#1a1a1a',
+  opacity REAL NOT NULL DEFAULT 1.0,
+  plan_prints INTEGER NOT NULL DEFAULT 0,
+  printed_count INTEGER NOT NULL DEFAULT 0,
+  waste_count INTEGER NOT NULL DEFAULT 0,
+  invalid INTEGER NOT NULL DEFAULT 0,
+  base_mask BLOB,
+  relief_mask BLOB,
+  carve_mask BLOB,
+  ink_mask BLOB,
+  narrow_mask BLOB,
+  outside_area REAL NOT NULL DEFAULT 0,
+  issues TEXT NOT NULL DEFAULT '[]',
+  log TEXT NOT NULL DEFAULT '[]',
+  confirmed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
 """
 
 MIN_BLOCKS, MAX_BLOCKS = 2, 8
@@ -96,6 +140,19 @@ def init_db():
     db.executescript(SCHEMA)
     db.commit()
     db.close()
+
+
+@app.errorhandler(400)
+@app.errorhandler(403)
+@app.errorhandler(404)
+@app.errorhandler(409)
+def json_error(err):
+    return jsonify({"description": str(err.description)}), err.code
+
+
+def now_ts():
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def row_to_block(r):
@@ -194,6 +251,143 @@ def fit_similarity(design, measured):
     rms = math.sqrt(sse / n)
     return {"tx": tx, "ty": ty, "rot_deg": math.degrees(theta),
             "scale": s, "rms_error": rms}
+
+
+# ---------------------------------------------------------------- 减版木刻流程 —— 几何内核
+
+FLOW_SCALE = 3.0          # 栅格化分辨率 px/mm(与前端检测 ANALYSIS_SCALE 一致)
+MASK_GAP = 1              # 灰度 PNG 中 1=凸面/着墨, 0=刻除
+STATUS_ORDER = {"draft": 0, "pending": 1, "printed": 2, "locked": 3}
+
+
+def rasterize_polys(polys, W, H, scale=FLOW_SCALE):
+    """多边形列表(mm 坐标)并集 → 位掩码(整数,位 i = 像素 y*W+x)。
+    扫描线算法,与前端 Canvas nonzero 填充、point_in_poly 的覆盖判定一致。"""
+    bits = 0
+    for pts in polys:
+        n = len(pts)
+        if n < 3:
+            continue
+        ys = [p[1] * scale for p in pts]
+        ymin = max(0, int(math.floor(min(ys) - 0.5)) + 1)
+        ymax = min(H - 1, int(math.floor(max(ys) + 0.5)))
+        for py in range(ymin, ymax + 1):
+            y = (py + 0.5) / scale
+            xs = []
+            j = n - 1
+            for i in range(n):
+                xi, yi = pts[i]
+                xj, yj = pts[j]
+                if (yi > y) != (yj > y):
+                    xs.append((xj - xi) * (y - yi) / (yj - yi) + xi)
+                j = i
+            xs.sort()
+            for k in range(0, len(xs) - 1, 2):
+                xa, xb = xs[k] * scale, xs[k + 1] * scale
+                x0 = max(0, int(math.floor(xa - 0.5)) + 1)
+                x1 = min(W - 1, int(math.floor(xb + 0.5)))
+                if x1 < x0:
+                    continue
+                row = (1 << (x1 + 1)) - 1
+                row ^= (1 << x0) - 1
+                bits |= row << (py * W)
+    return bits
+
+
+def _erode_rows(bits, W, H, r):
+    """逐行水平腐蚀:每行保留左右各 r 像素内全为 1 的位置。"""
+    out = 0
+    rowmask = (1 << W) - 1
+    for y in range(H):
+        row = (bits >> (y * W)) & rowmask
+        e = row
+        for k in range(1, r + 1):
+            e &= (row >> k) & (row << k) & rowmask
+        out |= e << (y * W)
+    return out
+
+
+def _dilate_rows(bits, W, H, r):
+    out = 0
+    rowmask = (1 << W) - 1
+    for y in range(H):
+        row = (bits >> (y * W)) & rowmask
+        d = row
+        for k in range(1, r + 1):
+            d |= (row >> k) | ((row << k) & rowmask)
+        out |= d << (y * W)
+    return out
+
+
+def _erode_cols(bits, W, H, r):
+    """竖直腐蚀:上下 r 行同列均为 1(按 W 位整掩码移位,行间天然不串位)。"""
+    e = bits
+    for k in range(1, r + 1):
+        e &= (bits >> (k * W)) & (bits << (k * W))
+    return e
+
+
+def _dilate_cols(bits, W, H, r):
+    d = bits
+    for k in range(1, r + 1):
+        d |= (bits >> (k * W)) | (bits << (k * W))
+    return d
+
+
+def morph_open_bits(bits, W, H, r):
+    """位域方形 (2r+1)² 8 邻域开运算:水平+竖直一维腐蚀后再膨胀。
+    凸面或连接桥任一方向窄于 (2r+1) 像素都会在结果中消失。"""
+    if r <= 0:
+        return bits
+    e = _erode_rows(bits, W, H, r)
+    e = _erode_cols(e, W, H, r)
+    d = _dilate_rows(e, W, H, r)
+    d = _dilate_cols(d, W, H, r)
+    return d
+
+
+
+_UNPACK_TABLE = [bytes((b >> i) & 1 for i in range(8)) for b in range(256)]
+
+
+def mask_to_bytes(bits, n):
+    """位掩码 → 每像素 1 字节(0/1),供形态学/PNG 使用(每字节查表展开为 8 字节)。"""
+    packed = bits.to_bytes((n + 7) // 8, "little")
+    out = b"".join(_UNPACK_TABLE[b] for b in packed)
+    return bytearray(out[:n])
+
+
+_GRAY_TABLE = bytes((0 if i == 0 else 255) for i in range(256))
+
+
+def encode_mask_png(mask_bytes, W, H):
+    """0/1 掩码 → 8 位灰度 PNG(每条扫描线加 filter 0)。"""
+    raw = bytearray()
+    gray = mask_bytes.translate(_GRAY_TABLE)
+    for y in range(H):
+        raw.append(0)
+        raw += gray[y * W:(y + 1) * W]
+    comp = zlib.compress(bytes(raw), 6)
+
+    def chunk(tag, data):
+        c = binascii.crc32(tag + data) & 0xffffffff
+        return (len(data).to_bytes(4, "big") + tag + data + c.to_bytes(4, "big"))
+
+    ihdr = W.to_bytes(4, "big") + H.to_bytes(4, "big") + bytes((8, 0, 0, 0, 0))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", comp) + chunk(b"IEND", b""))
+
+
+def mask_b64(b):
+    if b is None:
+        return None
+    return "data:image/png;base64," + base64.b64encode(b).decode("ascii")
+
+
+def add_stage_log(row_stage, text):
+    log = json.loads(row_stage["log"] or "[]")
+    log.append({"at": now_ts(), "text": text})
+    return log
 
 
 # ---------------------------------------------------------------- 页面
@@ -551,6 +745,428 @@ def delete_plan(plan_id):
     db.execute("DELETE FROM plans WHERE id=?", (plan_id,))
     db.commit()
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- 减版木刻流程 API
+
+def get_flow_or_404(fid):
+    r = get_db().execute("SELECT * FROM reduction_flows WHERE id=?", (fid,)).fetchone()
+    if not r:
+        abort(404, "流程不存在")
+    return r
+
+
+def flow_stage_rows(fid):
+    return get_db().execute(
+        "SELECT * FROM reduction_stages WHERE flow_id=? ORDER BY seq, id", (fid,)).fetchall()
+
+
+def stage_to_dict(r, masks=True):
+    d = {
+        "id": r["id"], "flow_id": r["flow_id"], "seq": r["seq"], "name": r["name"],
+        "status": r["status"], "carve_polys": json.loads(r["carve_polys"] or "[]"),
+        "zone_ids": json.loads(r["zone_ids"] or "[]"),
+        "ink_color": r["ink_color"], "opacity": r["opacity"],
+        "plan_prints": r["plan_prints"], "printed_count": r["printed_count"],
+        "waste_count": r["waste_count"], "invalid": bool(r["invalid"]),
+        "outside_area": r["outside_area"], "issues": json.loads(r["issues"] or "[]"),
+        "log": json.loads(r["log"] or "[]"),
+        "confirmed_at": r["confirmed_at"], "created_at": r["created_at"],
+    }
+    if masks:
+        d.update({
+            "base_png": mask_b64(r["base_mask"]),
+            "relief_png": mask_b64(r["relief_mask"]),
+            "carve_png": mask_b64(r["carve_mask"]),
+            "ink_png": mask_b64(r["ink_mask"]),
+            "narrow_png": mask_b64(r["narrow_mask"]),
+        })
+    return d
+
+
+def flow_to_dict(r, stages=None, masks=True):
+    d = {
+        "id": r["id"], "project_id": r["project_id"],
+        "source_block_id": r["source_block_id"], "name": r["name"],
+        "paper_w": r["paper_w"], "paper_h": r["paper_h"],
+        "grid_w": r["grid_w"], "grid_h": r["grid_h"], "scale": r["scale"],
+        "reg_marks": json.loads(r["reg_marks"] or "[]"),
+        "snapshot": json.loads(r["snapshot"] or "{}"),
+        "created_at": r["created_at"],
+    }
+    d["stages"] = [stage_to_dict(s, masks) for s in (stages or flow_stage_rows(r["id"]))]
+    return d
+
+
+def recompute_flow(fid):
+    """按顺序重算全部阶段的差分掩码并写库,返回 (flow_row, stage_rows)。
+
+    减版顺序:在剩余凸面(base)上着墨印刷 → 刻掉本轮刻除区 → 得到下一阶段的凸面。
+    base   = 上阶段刻后剩余凸面(首阶段为来源色版区域并集快照)
+    ink    = 本阶段着墨区域快照并集 ∩ base     (印刷发生在刻除之前)
+    carve  = 本轮刻除多边形 ∩ base             (刻在已刻掉处自然无效)
+    relief = base − carve                     (交给下一阶段的凸面)
+    narrow = relief 中窄于该版最小线宽的部分(刻后凸面/连接桥,方形开运算消失区)
+    """
+    db = get_db()
+    flow = get_flow_or_404(fid)
+    W, H, scale = flow["grid_w"], flow["grid_h"], flow["scale"]
+    snap = json.loads(flow["snapshot"] or "{}")
+    n = W * H
+    cell_area = (1.0 / scale) ** 2
+    min_w = float(snap.get("min_line_width", 1.5))
+    r = max(1, round(min_w / 2 * scale))
+
+    zones = snap.get("zones", [])
+    zone_cache = {z["id"]: rasterize_polys([z["pts"]], W, H, scale) for z in zones}
+    base_bits = 0
+    for z in zones:
+        base_bits |= rasterize_polys([z["pts"]], W, H, scale)
+    init_bits = base_bits
+
+    rows = flow_stage_rows(fid)
+    prev = None
+    for st in rows:
+        ink_bits = 0
+        for zid in json.loads(st["zone_ids"] or "[]"):
+            zb = zone_cache.get(zid)
+            if zb is not None:
+                ink_bits |= zb
+        ink_bits &= base_bits
+        carve_bits = rasterize_polys(json.loads(st["carve_polys"] or "[]"), W, H, scale) & base_bits
+        relief_bits = base_bits & ~carve_bits
+        # 检查刻版之后的剩余凸面/连接桥:细于最小线宽处开运算后消失
+        opened_bits = morph_open_bits(relief_bits, W, H, r)
+        narrow_bits = relief_bits & ~opened_bits
+
+        issues = []
+        # 着墨意图覆盖了当前凸面之外(此前已刻掉)的区域
+        ink_want = 0
+        for zid in json.loads(st["zone_ids"] or "[]"):
+            zb = zone_cache.get(zid)
+            if zb is not None:
+                ink_want |= zb
+        overflow_bits = ink_want & ~base_bits
+        if overflow_bits:
+            area = overflow_bits.bit_count() * cell_area
+            issues.append({
+                "type": "overflow", "blocking": True,
+                "text": f"着墨区约 {area:.1f} mm² 超出剩余凸面(此前已刻掉,无法着墨)",
+            })
+        narrow_area = narrow_bits.bit_count() * cell_area
+        if narrow_area:
+            issues.append({
+                "type": "narrow", "blocking": True,
+                "text": f"凸面或连接桥约 {narrow_area:.1f} mm² 窄于该版最小线宽 {min_w:g} mm,易断",
+            })
+        # 刻除多边形伸出原始木面的面积(提示用;刻在当轮凸面外但仍在木面内=刻已刻区,自动忽略)
+        raw_out = rasterize_polys(json.loads(st["carve_polys"] or "[]"), W, H, scale) & ~init_bits
+        outside_area = raw_out.bit_count() * cell_area
+        if outside_area > 0.5:
+            issues.append({
+                "type": "outside", "blocking": False,
+                "text": f"刻除区约 {outside_area:.1f} mm² 落在木面之外,已忽略",
+            })
+        if prev is not None and prev["status"] in ("draft", "pending"):
+            issues.append({
+                "type": "prev_unprinted", "blocking": True,
+                "text": f"前一印次「{prev['name']}」尚未印完(状态:"
+                        f"{'草稿' if prev['status'] == 'draft' else '待印'}),不应继续刻版",
+            })
+
+        db.execute(
+            """UPDATE reduction_stages SET base_mask=?,relief_mask=?,carve_mask=?,
+               ink_mask=?,narrow_mask=?,outside_area=?,issues=? WHERE id=?""",
+            (encode_mask_png(mask_to_bytes(base_bits, n), W, H),
+             encode_mask_png(mask_to_bytes(relief_bits, n), W, H),
+             encode_mask_png(mask_to_bytes(carve_bits, n), W, H),
+             encode_mask_png(mask_to_bytes(ink_bits, n), W, H),
+             encode_mask_png(mask_to_bytes(narrow_bits, n), W, H),
+             outside_area, json.dumps(issues, ensure_ascii=False), st["id"]))
+        base_bits = relief_bits
+        prev = st
+    db.commit()
+    return flow, flow_stage_rows(fid)
+
+
+@app.get("/api/projects/<int:pid>/flows")
+def list_flows(pid):
+    rows = get_db().execute(
+        "SELECT * FROM reduction_flows WHERE project_id=? ORDER BY id", (pid,)).fetchall()
+    return jsonify([flow_to_dict(r, masks=False) for r in rows])
+
+
+@app.get("/api/flows/<int:fid>")
+def get_flow(fid):
+    flow, rows = recompute_flow(fid)
+    return jsonify(flow_to_dict(flow, rows))
+
+
+@app.post("/api/projects/<int:pid>/flows")
+def create_flow(pid):
+    proj = load_project_full(pid)
+    data = request.get_json(force=True) or {}
+    bid = data.get("source_block_id")
+    block = next((b for b in proj["blocks"] if b["id"] == bid), None)
+    if not block:
+        abort(400, "请选择一块来源色版(色版区域决定初始凸面)")
+    if not block["regions"]:
+        abort(400, "来源色版尚无封闭区域,请先在「区域勾勒」中勾勒色版区域")
+    pw, ph = proj["paper_w"], proj["paper_h"]
+    if proj["orientation"] == "landscape":
+        pw, ph = ph, pw
+    sel = set(data.get("zone_ids") or [])
+    zones = [{"id": r["id"], "pts": r["points"],
+              "target_color": r["target_color"] or block["target_color"]}
+             for r in block["regions"] if not sel or r["id"] in sel]
+    if not zones:
+        abort(400, "至少选取一个色版区域建立流程")
+    W = max(1, round(pw * FLOW_SCALE))
+    H = max(1, round(ph * FLOW_SCALE))
+    snapshot = {
+        "source_block_name": block["name"], "ink_color": block["ink_color"],
+        "opacity": block["opacity"], "target_color": block["target_color"],
+        "min_line_width": block["min_line_width"],
+        "base_region_ids": [z["id"] for z in zones], "zones": zones,
+        "paper_w": pw, "paper_h": ph,
+        "project_name": proj["name"], "frozen_at": now_ts(),
+    }
+    db = get_db()
+    cur = db.execute(
+        """INSERT INTO reduction_flows(project_id,source_block_id,name,paper_w,paper_h,
+                                      grid_w,grid_h,scale,reg_marks,snapshot)
+           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (pid, bid, (data.get("name") or f"{block['name']}·减版流程").strip(),
+         pw, ph, W, H, FLOW_SCALE, json.dumps(block["reg_marks"]),
+         json.dumps(snapshot, ensure_ascii=False)))
+    db.commit()
+    flow, rows = recompute_flow(cur.lastrowid)
+    return jsonify(flow_to_dict(flow, rows)), 201
+
+
+@app.put("/api/flows/<int:fid>")
+def update_flow(fid):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    if "name" in data:
+        db.execute("UPDATE reduction_flows SET name=? WHERE id=?",
+                   ((data["name"] or "未命名流程").strip(), fid))
+        db.commit()
+    flow, rows = recompute_flow(fid)
+    return jsonify(flow_to_dict(flow, rows))
+
+
+@app.delete("/api/flows/<int:fid>")
+def delete_flow(fid):
+    get_flow_or_404(fid)
+    db = get_db()
+    db.execute("DELETE FROM reduction_flows WHERE id=?", (fid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/flows/<int:fid>/stages")
+def add_stage(fid):
+    flow = get_flow_or_404(fid)
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    nxt = db.execute("SELECT COALESCE(MAX(seq)+1,0) s FROM reduction_stages WHERE flow_id=?",
+                     (fid,)).fetchone()["s"]
+    snap = json.loads(flow["snapshot"] or "{}")
+    if "zone_ids" in data:
+        zone_ids = data["zone_ids"]
+    elif nxt == 0:
+        zone_ids = snap.get("base_region_ids", [])  # 首遍通常满版着墨
+    else:
+        zone_ids = []                                # 后续遍:从剩余凸面区域中勾选
+    cur = db.execute(
+        """INSERT INTO reduction_stages(flow_id,seq,name,carve_polys,zone_ids,ink_color,
+                                        opacity,plan_prints,log)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (fid, nxt, (data.get("name") or f"第{nxt + 1}阶段").strip(),
+         json.dumps(data.get("carve_polys") or []),
+         json.dumps(zone_ids),
+         data.get("ink_color") or snap.get("ink_color", "#1a1a1a"),
+         float(data.get("opacity", snap.get("opacity", 1.0))),
+         int(data.get("plan_prints", 0)),
+         json.dumps([{"at": now_ts(), "text": "建立草稿阶段"}], ensure_ascii=False)))
+    db.commit()
+    flow2, rows = recompute_flow(fid)
+    return jsonify(flow_to_dict(flow2, rows)), 201
+
+
+def _editable_draft_stage(sid):
+    db = get_db()
+    st = db.execute("SELECT * FROM reduction_stages WHERE id=?", (sid,)).fetchone()
+    if not st:
+        abort(404, "阶段不存在")
+    if st["status"] == "locked":
+        abort(409, "该阶段已锁定,不可修改")
+    if st["status"] != "draft":
+        abort(409, "阶段已确认,刻除区与快照不可修改(如需重刻请新建阶段)")
+    later = db.execute(
+        "SELECT COUNT(*) c FROM reduction_stages WHERE flow_id=? AND seq>? AND status IN ('printed','locked')",
+        (st["flow_id"], st["seq"])).fetchone()["c"]
+    if later:
+        abort(409, "后续已有已印/锁定阶段,木版上的刻除不可恢复,不能再改本阶段刻除区")
+    return st
+
+
+@app.put("/api/stages/<int:sid>")
+def update_stage(sid):
+    st = _editable_draft_stage(sid)
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    fields, vals = [], []
+    for k in ("name", "ink_color", "opacity", "plan_prints"):
+        if k in data:
+            fields.append(f"{k}=?")
+            vals.append(data[k])
+    if "carve_polys" in data:
+        fields.append("carve_polys=?")
+        vals.append(json.dumps(data["carve_polys"]))
+    if "zone_ids" in data:
+        fields.append("zone_ids=?")
+        vals.append(json.dumps(data["zone_ids"]))
+    if fields:
+        vals.append(sid)
+        db.execute(f"UPDATE reduction_stages SET {', '.join(fields)} WHERE id=?", vals)
+        # 仅几何改动(刻除区/着墨区)改变后续凸面容差,其后的全部阶段立即失效;
+        # 改名/油墨/计划印数不影响几何
+        geom_changed = "carve_polys=?" in fields or "zone_ids=?" in fields
+        if geom_changed:
+            db.execute(
+                "UPDATE reduction_stages SET invalid=1 WHERE flow_id=? AND seq>?",
+                (st["flow_id"], st["seq"]))
+            log = add_stage_log(st, "草稿几何已修改,后续阶段标记为失效待复核")
+        else:
+            log = add_stage_log(st, "草稿信息已更新")
+        db.execute("UPDATE reduction_stages SET log=? WHERE id=?",
+                   (json.dumps(log, ensure_ascii=False), sid))
+        db.commit()
+    flow, rows = recompute_flow(st["flow_id"])
+    return jsonify(flow_to_dict(flow, rows))
+
+
+@app.post("/api/stages/<int:sid>/confirm")
+def confirm_stage(sid):
+    db = get_db()
+    st = db.execute("SELECT * FROM reduction_stages WHERE id=?", (sid,)).fetchone()
+    if not st:
+        abort(404, "阶段不存在")
+    if st["status"] != "draft":
+        abort(409, "仅草稿阶段可以确认")
+    flow, rows = recompute_flow(st["flow_id"])
+    cur = next((x for x in rows if x["id"] == sid), None)
+    issues = json.loads(cur["issues"] or "[]")
+    blocking = [i for i in issues if i.get("blocking")]
+    force = bool((request.get_json(silent=True) or {}).get("force"))
+    if blocking and not force:
+        abort(409, "存在阻断性检查:" + "；".join(i["text"] for i in blocking))
+    if len(json.loads(cur["carve_polys"] or "[]")) == 0:
+        abort(400, "请先在上一阶段副本中勾画本轮刻除区")
+    # 冻结来源色版与几何快照(阶段级:复制流程快照并记录确认时刻)
+    snap = json.loads(flow["snapshot"] or "{}")
+    stage_snap = dict(snap)
+    stage_snap["confirmed_at"] = now_ts()
+    stage_snap["grid"] = [flow["grid_w"], flow["grid_h"], flow["scale"]]
+    log = json.loads(cur["log"] or "[]")
+    log.append({"at": now_ts(),
+                "text": "确认阶段:冻结来源色版与几何快照,输出镜像刻除图/保留面图/操作记录"
+                        + ("(强制确认:存在未解决检查项)" if blocking else "")})
+    db.execute(
+        "UPDATE reduction_stages SET status='pending',invalid=0,confirmed_at=?,log=? WHERE id=?",
+        (now_ts(), json.dumps(log, ensure_ascii=False), sid))
+    db.commit()
+    flow2, rows2 = recompute_flow(st["flow_id"])
+    return jsonify(flow_to_dict(flow2, rows2))
+
+
+@app.post("/api/stages/<int:sid>/withdraw")
+def withdraw_stage(sid):
+    db = get_db()
+    st = db.execute("SELECT * FROM reduction_stages WHERE id=?", (sid,)).fetchone()
+    if not st:
+        abort(404, "阶段不存在")
+    if st["status"] != "pending":
+        abort(409, "仅待印阶段可撤回到草稿")
+    log = add_stage_log(st, "待印阶段撤回为草稿")
+    db.execute("UPDATE reduction_stages SET status='draft',log=? WHERE id=?",
+               (json.dumps(log, ensure_ascii=False), sid))
+    db.commit()
+    flow, rows = recompute_flow(st["flow_id"])
+    return jsonify(flow_to_dict(flow, rows))
+
+
+@app.post("/api/stages/<int:sid>/print")
+def print_stage(sid):
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    st = db.execute("SELECT * FROM reduction_stages WHERE id=?", (sid,)).fetchone()
+    if not st:
+        abort(404, "阶段不存在")
+    if st["status"] != "pending":
+        abort(409, "仅待印阶段可以记录印刷完成")
+    printed = int(data.get("printed_count", st["printed_count"]))
+    waste = int(data.get("waste_count", st["waste_count"]))
+    if printed < 0 or waste < 0:
+        abort(400, "印数与废张不能为负")
+    log = add_stage_log(st, f"印刷完成:合格 {printed} 张,废张 {waste} 张")
+    db.execute(
+        "UPDATE reduction_stages SET status='printed',printed_count=?,waste_count=?,log=? WHERE id=?",
+        (printed, waste, json.dumps(log, ensure_ascii=False), sid))
+    db.commit()
+    flow, rows = recompute_flow(st["flow_id"])
+    return jsonify(flow_to_dict(flow, rows))
+
+
+@app.post("/api/stages/<int:sid>/lock")
+def lock_stage(sid):
+    db = get_db()
+    st = db.execute("SELECT * FROM reduction_stages WHERE id=?", (sid,)).fetchone()
+    if not st:
+        abort(404, "阶段不存在")
+    if st["status"] != "printed":
+        abort(409, "仅已印阶段可以锁定完成")
+    log = add_stage_log(st, "阶段锁定完成,刻除区/凸面/印数全部归档")
+    db.execute("UPDATE reduction_stages SET status='locked',log=? WHERE id=?",
+               (json.dumps(log, ensure_ascii=False), sid))
+    db.commit()
+    flow, rows = recompute_flow(st["flow_id"])
+    return jsonify(flow_to_dict(flow, rows))
+
+
+@app.post("/api/stages/<int:sid>/unlock")
+def unlock_stage(sid):
+    db = get_db()
+    st = db.execute("SELECT * FROM reduction_stages WHERE id=?", (sid,)).fetchone()
+    if not st:
+        abort(404, "阶段不存在")
+    if st["status"] != "locked":
+        abort(409, "仅锁定阶段可以解锁")
+    log = add_stage_log(st, "解锁(回到已印状态,几何与印数不变)")
+    db.execute("UPDATE reduction_stages SET status='printed',log=? WHERE id=?",
+               (json.dumps(log, ensure_ascii=False), sid))
+    db.commit()
+    flow, rows = recompute_flow(st["flow_id"])
+    return jsonify(flow_to_dict(flow, rows))
+
+
+@app.delete("/api/stages/<int:sid>")
+def delete_stage(sid):
+    db = get_db()
+    st = db.execute("SELECT * FROM reduction_stages WHERE id=?", (sid,)).fetchone()
+    if not st:
+        abort(404, "阶段不存在")
+    if st["status"] != "draft":
+        abort(409, "仅草稿阶段可以删除(已印阶段及刻掉的区域不能恢复)")
+    fid = st["flow_id"]
+    db.execute("DELETE FROM reduction_stages WHERE id=?", (sid,))
+    db.execute("UPDATE reduction_stages SET seq=seq-1 WHERE flow_id=? AND seq>?",
+               (fid, st["seq"]))
+    db.commit()
+    flow, rows = recompute_flow(fid)
+    return jsonify(flow_to_dict(flow, rows))
 
 
 if __name__ == "__main__":

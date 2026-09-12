@@ -23,7 +23,8 @@
   <button class="tab" data-tab="register">④ 套准模拟</button>
   <button class="tab" data-tab="trial">⑤ 试印校准</button>
   <button class="tab" data-tab="order">⑥ 版序优化</button>
-  <button class="tab" data-tab="export">⑦ 输出</button>
+  <button class="tab" data-tab="reduction">⑦ 减版刻印流程</button>
+  <button class="tab" data-tab="export">⑧ 输出</button>
 </nav>
 
 <main>
@@ -164,7 +165,49 @@
     </div>
   </section>
 
-  <!-- ⑦ 输出 -->
+  <!-- ⑦ 减版刻印流程 -->
+  <section id="tab-reduction" class="tab-pane">
+    <div class="side">
+      <div class="panel">
+        <h2>减版刻印流程</h2>
+        <p class="hint">同一块实体木版的连续刻印阶段:每遍先在<b>剩余凸面</b>上着墨印刷,再刻掉本轮区域。
+          已印阶段及此前刻掉的区域不可恢复。</p>
+        <label>当前流程 <select id="rf-flow-select"></select></label>
+        <div class="btn-row">
+          <button id="btn-rf-new">从色版建立流程</button>
+          <button id="btn-rf-del" class="danger">删除流程</button>
+        </div>
+        <div id="rf-meta" class="hint"></div>
+        <h3>阶段列表</h3>
+        <ul id="rf-stage-list" class="plain-list"></ul>
+        <button id="btn-rf-add-stage">＋ 在上一阶段副本中新建草稿</button>
+      </div>
+      <div class="panel" id="rf-editor-panel">
+        <h2>阶段编辑</h2>
+        <div id="rf-editor"></div>
+      </div>
+    </div>
+    <div class="canvas-wrap" style="flex:1">
+      <div class="rf-slider-row">
+        <span>阶段滑杆</span>
+        <input id="rf-slider" type="range" min="0" max="0" step="1" value="0" style="flex:1">
+        <span id="rf-slider-label" class="tag"></span>
+      </div>
+      <div class="rf-view-row">
+        <label class="rf-check"><input type="checkbox" id="rf-show-sketch" checked> 底稿</label>
+        <label class="rf-check"><input type="checkbox" id="rf-show-relief"> 剩余凸面</label>
+        <label class="rf-check"><input type="checkbox" id="rf-show-narrow" checked> 窄线/窄桥</label>
+        <label class="rf-check"><input type="checkbox" id="rf-show-inkzones"> 着墨区</label>
+        <label class="rf-check"><input type="checkbox" id="rf-highlight" checked> 高亮新刻区</label>
+        <label class="rf-check"><input type="checkbox" id="rf-show-poly" checked> 刻除多边形</label>
+        <label class="rf-check"><input type="checkbox" id="rf-mirror"> 镜像视图(同木面)</label>
+      </div>
+      <canvas id="reduction-canvas"></canvas>
+      <div id="rf-issues" class="rf-issues"></div>
+    </div>
+  </section>
+
+  <!-- ⑧ 输出 -->
   <section id="tab-export" class="tab-pane">
     <div class="panel">
       <h2>逐版镜像转印图</h2>
@@ -188,6 +231,7 @@
 <script src="/static/js/preview.js"></script>
 <script src="/static/js/trial.js"></script>
 <script src="/static/js/plan.js"></script>
+<script src="/static/js/reduction.js"></script>
 <script src="/static/js/main.js"></script>
 </body>
 </html>

@@ -13,6 +13,7 @@ function refreshAllPanels() {
   renderLockTable();
   loadTrialList();
   loadPlanList();
+  loadFlowList();
   renderTransferList();
   App.issues = [];
   issueLayer = null;
@@ -41,6 +42,8 @@ async function openProject(id) {
   App.draft = [];
   App.trialCorr = null;
   App.trialOverlay = false;
+  RF.flows = []; RF.flow = null; RF.currentFlowId = null;
+  RF.selectedStageId = null; RF.working = []; RF.maskImgs = {};
   loadSketch();
   refreshAllPanels();
 }
@@ -94,6 +97,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   initRegisterTab();
   initTrialTab();
   initPlanTab();
+  initReductionTab();
   initExportTab();
   window.addEventListener("resize", redrawAll);
   const rows = await loadProjectList();
