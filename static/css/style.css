@@ -141,3 +141,11 @@ footer { text-align: center; font-size: 12px; color: #8a7f6a; padding: 14px; }
 .rf-zones label { display: flex; gap: 4px; align-items: center; margin: 2px 0; font-size: 12px; }
 .rf-zones input { width: auto; }
 .rf-snap { font-size: 11px; color: #7a6f5c; margin: 4px 0; line-height: 1.5; }
+.rf-create {
+  border: 1px dashed var(--accent); border-radius: 6px;
+  background: #fbf3ec; padding: 8px 10px; margin: 6px 0;
+}
+.rf-create label { display: block; margin: 4px 0; font-size: 12px; }
+.rf-create .rf-zones { max-height: 170px; overflow: auto; margin: 4px 0; }
+.rf-create .rf-zones label { display: flex; gap: 5px; align-items: center; }
+.rf-create .rf-zones input { width: auto; }

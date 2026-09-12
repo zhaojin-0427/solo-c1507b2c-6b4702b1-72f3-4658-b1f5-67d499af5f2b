@@ -177,6 +177,22 @@
           <button id="btn-rf-new">从色版建立流程</button>
           <button id="btn-rf-del" class="danger">删除流程</button>
         </div>
+        <div id="rf-create-box" class="rf-create" style="display:none">
+          <label>来源色版
+            <select id="rf-new-block"></select>
+          </label>
+          <div class="hint">勾选作为初始凸面的色版区域(即纸面与套准标记沿用该版设置):</div>
+          <div id="rf-new-zones" class="rf-zones"></div>
+          <div class="marks-row">
+            <button id="btn-rf-zones-all" class="secondary" type="button">全选</button>
+            <button id="btn-rf-zones-none" class="secondary" type="button">清空</button>
+          </div>
+          <label>流程名称 <input id="rf-new-name" type="text" style="width:100%"></label>
+          <div class="btn-row">
+            <button id="btn-rf-create-ok">建立流程</button>
+            <button id="btn-rf-create-cancel" class="secondary">取消</button>
+          </div>
+        </div>
         <div id="rf-meta" class="hint"></div>
         <h3>阶段列表</h3>
         <ul id="rf-stage-list" class="plain-list"></ul>

@@ -351,31 +351,77 @@ _UNPACK_TABLE = [bytes((b >> i) & 1 for i in range(8)) for b in range(256)]
 
 
 def mask_to_bytes(bits, n):
-    """位掩码 → 每像素 1 字节(0/1),供形态学/PNG 使用(每字节查表展开为 8 字节)。"""
+    """位掩码 → 每像素 1 字节(0/1),供形态学使用(每字节查表展开为 8 字节)。"""
     packed = bits.to_bytes((n + 7) // 8, "little")
     out = b"".join(_UNPACK_TABLE[b] for b in packed)
     return bytearray(out[:n])
 
 
-_GRAY_TABLE = bytes((0 if i == 0 else 255) for i in range(256))
+def pack_bits(by):
+    """每像素 1 字节(0/1) → 位掩码 int(小端位序)。"""
+    out = bytearray((len(by) + 7) // 8)
+    for k in range(8):
+        for i, v in enumerate(by[k::8]):
+            if v:
+                out[i] |= 1 << k
+    return int.from_bytes(bytes(out), "little")
 
 
-def encode_mask_png(mask_bytes, W, H):
-    """0/1 掩码 → 8 位灰度 PNG(每条扫描线加 filter 0)。"""
+_REV_BYTE = bytes(int(f"{b:08b}"[::-1], 2) for b in range(256))
+
+
+def encode_mask_png(bits, W, H):
+    """位掩码 → 1 位色深灰度 PNG(黑=0/刻除,白=1/凸面),每扫描行加 filter 0。
+    PNG 行内按 MSB-first 打包且每行按字节对齐,内部位掩码为 LSB-first,
+    故逐行独立打包(行宽非 8 倍数时行尾 padding 必须清零),再逐字节位序反转。"""
+    row_bytes = (W + 7) // 8
+    rowmask = (1 << W) - 1
     raw = bytearray()
-    gray = mask_bytes.translate(_GRAY_TABLE)
     for y in range(H):
         raw.append(0)
-        raw += gray[y * W:(y + 1) * W]
+        row = ((bits >> (y * W)) & rowmask).to_bytes(row_bytes, "little")
+        raw += row.translate(_REV_BYTE)
     comp = zlib.compress(bytes(raw), 6)
 
     def chunk(tag, data):
         c = binascii.crc32(tag + data) & 0xffffffff
         return (len(data).to_bytes(4, "big") + tag + data + c.to_bytes(4, "big"))
 
-    ihdr = W.to_bytes(4, "big") + H.to_bytes(4, "big") + bytes((8, 0, 0, 0, 0))
+    ihdr = W.to_bytes(4, "big") + H.to_bytes(4, "big") + bytes((1, 0, 0, 0, 0))
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
             + chunk(b"IDAT", comp) + chunk(b"IEND", b""))
+
+
+def decode_mask_png(blob):
+    """解码本系统生成的 1 位(兼容 8 位)灰度 PNG,返回 (位掩码, W, H)。"""
+    pos = 8
+    idat = b""
+    W = H = depth = 0
+    while pos < len(blob):
+        ln = int.from_bytes(blob[pos:pos + 4], "big")
+        tag = blob[pos + 4:pos + 8]
+        data = blob[pos + 8:pos + 8 + ln]
+        if tag == b"IHDR":
+            W = int.from_bytes(data[0:4], "big")
+            H = int.from_bytes(data[4:8], "big")
+            depth = data[8]
+        elif tag == b"IDAT":
+            idat += data
+        pos += 12 + ln
+    raw = zlib.decompress(idat)
+    if depth == 1:
+        row_bytes = (W + 7) // 8
+        bits = 0
+        for y in range(H):
+            row = raw[y * (row_bytes + 1) + 1:y * (row_bytes + 1) + 1 + row_bytes]
+            bits |= int.from_bytes(row.translate(_REV_BYTE), "little") << (y * W)
+        return bits, W, H
+    # 兼容旧版 8 位灰度
+    n = W * H
+    out = bytearray(n)
+    for y in range(H):
+        out[y * W:(y + 1) * W] = raw[y * (W + 1) + 1:y * (W + 1) + 1 + W]
+    return pack_bits(out), W, H
 
 
 def mask_b64(b):
@@ -799,14 +845,13 @@ def flow_to_dict(r, stages=None, masks=True):
 
 
 def recompute_flow(fid):
-    """按顺序重算全部阶段的差分掩码并写库,返回 (flow_row, stage_rows)。
+    """重算**草稿**阶段的差分掩码并写库,返回 (flow_row, stage_rows)。
+
+    已确认阶段(pending/printed/locked)的几何在确认时刻冻结:
+    直接读取库存 base/relief 掩码作为后续阶段基准,绝不重新栅格化,
+    因此修改较早草稿不会改变已确认阶段的历史回放与导出。
 
     减版顺序:在剩余凸面(base)上着墨印刷 → 刻掉本轮刻除区 → 得到下一阶段的凸面。
-    base   = 上阶段刻后剩余凸面(首阶段为来源色版区域并集快照)
-    ink    = 本阶段着墨区域快照并集 ∩ base     (印刷发生在刻除之前)
-    carve  = 本轮刻除多边形 ∩ base             (刻在已刻掉处自然无效)
-    relief = base − carve                     (交给下一阶段的凸面)
-    narrow = relief 中窄于该版最小线宽的部分(刻后凸面/连接桥,方形开运算消失区)
     """
     db = get_db()
     flow = get_flow_or_404(fid)
@@ -827,12 +872,22 @@ def recompute_flow(fid):
     rows = flow_stage_rows(fid)
     prev = None
     for st in rows:
+        if st["status"] != "draft":
+            # 冻结阶段:掩码以库中确认为准,只解码、不重算、不覆写
+            frozen_base, _, _ = decode_mask_png(st["base_mask"])
+            frozen_relief, _, _ = decode_mask_png(st["relief_mask"])
+            base_bits = frozen_relief
+            prev = st
+            continue
+
+        zone_ids = json.loads(st["zone_ids"] or "[]")
         ink_bits = 0
-        for zid in json.loads(st["zone_ids"] or "[]"):
+        ink_want = 0
+        for zid in zone_ids:
             zb = zone_cache.get(zid)
             if zb is not None:
-                ink_bits |= zb
-        ink_bits &= base_bits
+                ink_want |= zb
+        ink_bits = ink_want & base_bits
         carve_bits = rasterize_polys(json.loads(st["carve_polys"] or "[]"), W, H, scale) & base_bits
         relief_bits = base_bits & ~carve_bits
         # 检查刻版之后的剩余凸面/连接桥:细于最小线宽处开运算后消失
@@ -841,11 +896,6 @@ def recompute_flow(fid):
 
         issues = []
         # 着墨意图覆盖了当前凸面之外(此前已刻掉)的区域
-        ink_want = 0
-        for zid in json.loads(st["zone_ids"] or "[]"):
-            zb = zone_cache.get(zid)
-            if zb is not None:
-                ink_want |= zb
         overflow_bits = ink_want & ~base_bits
         if overflow_bits:
             area = overflow_bits.bit_count() * cell_area
@@ -877,11 +927,11 @@ def recompute_flow(fid):
         db.execute(
             """UPDATE reduction_stages SET base_mask=?,relief_mask=?,carve_mask=?,
                ink_mask=?,narrow_mask=?,outside_area=?,issues=? WHERE id=?""",
-            (encode_mask_png(mask_to_bytes(base_bits, n), W, H),
-             encode_mask_png(mask_to_bytes(relief_bits, n), W, H),
-             encode_mask_png(mask_to_bytes(carve_bits, n), W, H),
-             encode_mask_png(mask_to_bytes(ink_bits, n), W, H),
-             encode_mask_png(mask_to_bytes(narrow_bits, n), W, H),
+            (encode_mask_png(base_bits, W, H),
+             encode_mask_png(relief_bits, W, H),
+             encode_mask_png(carve_bits, W, H),
+             encode_mask_png(ink_bits, W, H),
+             encode_mask_png(narrow_bits, W, H),
              outside_area, json.dumps(issues, ensure_ascii=False), st["id"]))
         base_bits = relief_bits
         prev = st
@@ -915,10 +965,18 @@ def create_flow(pid):
     pw, ph = proj["paper_w"], proj["paper_h"]
     if proj["orientation"] == "landscape":
         pw, ph = ph, pw
-    sel = set(data.get("zone_ids") or [])
+    valid_ids = {r["id"] for r in block["regions"]}
+    raw_sel = data.get("zone_ids")
+    if raw_sel is None:
+        chosen = valid_ids                       # 未显式给出:默认全部
+    else:
+        chosen = set(raw_sel)
+        bad = chosen - valid_ids
+        if bad:
+            abort(400, f"区域 {sorted(bad)} 不属于来源色版「{block['name']}」")
     zones = [{"id": r["id"], "pts": r["points"],
               "target_color": r["target_color"] or block["target_color"]}
-             for r in block["regions"] if not sel or r["id"] in sel]
+             for r in block["regions"] if r["id"] in chosen]
     if not zones:
         abort(400, "至少选取一个色版区域建立流程")
     W = max(1, round(pw * FLOW_SCALE))
@@ -1090,8 +1148,8 @@ def withdraw_stage(sid):
         abort(404, "阶段不存在")
     if st["status"] != "pending":
         abort(409, "仅待印阶段可撤回到草稿")
-    log = add_stage_log(st, "待印阶段撤回为草稿")
-    db.execute("UPDATE reduction_stages SET status='draft',log=? WHERE id=?",
+    log = add_stage_log(st, "待印阶段撤回为草稿,按最新上游几何重新参与差分计算")
+    db.execute("UPDATE reduction_stages SET status='draft',invalid=0,log=? WHERE id=?",
                (json.dumps(log, ensure_ascii=False), sid))
     db.commit()
     flow, rows = recompute_flow(st["flow_id"])
@@ -1107,6 +1165,8 @@ def print_stage(sid):
         abort(404, "阶段不存在")
     if st["status"] != "pending":
         abort(409, "仅待印阶段可以记录印刷完成")
+    if st["invalid"]:
+        abort(409, "该待印阶段已因上游草稿改动而失效:请先「撤回为草稿」复核并重新确认后,才能登记已印")
     printed = int(data.get("printed_count", st["printed_count"]))
     waste = int(data.get("waste_count", st["waste_count"]))
     if printed < 0 or waste < 0:

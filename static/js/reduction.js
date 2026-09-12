@@ -345,8 +345,20 @@ function renderEditor() {
       toast("草稿已删除");
     }));
   } else if (st.status === "pending") {
-    actions.appendChild(printBtn(st));
-    actions.appendChild(actionBtn("撤回为草稿", "secondary", async () => {
+    if (st.invalid) {
+      const warn = document.createElement("div");
+      warn.className = "rf-issue block";
+      warn.textContent = "⛔ 该待印阶段已因较早草稿的几何改动而失效,快照与实际凸面不再一致。"
+        + "请先「撤回为草稿」复核刻除区/着墨区并重新确认,之后才能登记已印。";
+      box.appendChild(warn);
+      const pb = printBtn(st);
+      pb.disabled = true;
+      pb.title = "失效阶段必须重新确认后才能登记已印";
+      actions.appendChild(pb);
+    } else {
+      actions.appendChild(printBtn(st));
+    }
+    actions.appendChild(actionBtn("撤回为草稿(重新复核)", "secondary", async () => {
       await saveFlow(`/api/stages/${st.id}/withdraw`, "POST");
     }));
   } else if (st.status === "printed") {
@@ -724,6 +736,42 @@ function downloadStageLog(st) {
 
 /* ---------------- 初始化 ---------------- */
 
+function openCreateBox() {
+  if (!App.project || !App.project.blocks.length) {
+    toast("请先在「项目与色版」建立色版,并在「区域勾勒」中勾勒区域", true);
+    return;
+  }
+  const sel = $("#rf-new-block");
+  sel.innerHTML = "";
+  blocksSorted().forEach((b, i) => {
+    const o = document.createElement("option");
+    o.value = b.id;
+    o.textContent = `${b.name}(${b.regions.length} 区域, ${b.ink_color}, 最小线宽 ${b.min_line_width}mm)`;
+    sel.appendChild(o);
+  });
+  fillCreateZones();
+  $("#rf-create-box").style.display = "block";
+}
+
+function fillCreateZones() {
+  const box = $("#rf-new-zones");
+  box.innerHTML = "";
+  const b = getBlock(+$("#rf-new-block").value);
+  if (!b) return;
+  if (!b.regions.length) {
+    box.innerHTML = "<div class='hint' style='color:#b00020'>该色版尚无封闭区域,请先到「区域勾勒」中勾勒。</div>";
+  }
+  b.regions.forEach((r, i) => {
+    const lab = document.createElement("label");
+    const tc = r.target_color || b.target_color;
+    lab.innerHTML = `<input type="checkbox" value="${r.id}" checked>
+      <span class="swatch-inline" style="background:${tc}"></span>
+      区域 ${i + 1}(${r.points.length} 点 · ${tc})`;
+    box.appendChild(lab);
+  });
+  $("#rf-new-name").value = b ? `${b.name}·减版流程` : "";
+}
+
 function renderReductionAll() {
   if (!RF.flow) {
     $("#rf-slider").max = 0; $("#rf-slider").value = 0;
@@ -740,25 +788,33 @@ function renderReductionAll() {
 }
 
 function initReductionTab() {
-  $("#btn-rf-new").addEventListener("click", async () => {
-    const blocks = blocksSorted();
-    if (!blocks.length) { toast("请先建立色版并勾勒区域", true); return; }
-    const list = blocks.map((b, i) => `${i + 1}. ${b.name}(${b.regions.length} 区域, ${b.ink_color})`).join("\n");
-    const ans = prompt("从哪块色版建立减版流程?(输入序号)\n" + list, "1");
-    if (ans === null) return;
-    const idx = parseInt(ans, 10) - 1;
-    const b = blocks[idx];
-    if (!b) return;
-    if (!b.regions.length) { toast("该色版尚无封闭区域,请先在「区域勾勒」中勾勒", true); return; }
-    const name = prompt("流程名称:", `${b.name}·减版流程`);
-    if (name === null) return;
+  $("#btn-rf-new").addEventListener("click", openCreateBox);
+
+  $("#rf-new-block").addEventListener("change", fillCreateZones);
+  $("#btn-rf-zones-all").addEventListener("click", () => {
+    $$("#rf-new-zones input[type=checkbox]").forEach(cb => { cb.checked = true; });
+  });
+  $("#btn-rf-zones-none").addEventListener("click", () => {
+    $$("#rf-new-zones input[type=checkbox]").forEach(cb => { cb.checked = false; });
+  });
+  $("#btn-rf-create-cancel").addEventListener("click", () => {
+    $("#rf-create-box").style.display = "none";
+  });
+  $("#btn-rf-create-ok").addEventListener("click", async () => {
+    const sel = $("#rf-new-block");
+    const b = getBlock(+sel.value);
+    if (!b) { toast("请选择来源色版", true); return; }
+    const ids = $$("#rf-new-zones input[type=checkbox]:checked").map(cb => +cb.value);
+    if (!ids.length) { toast("请至少勾选一个色版区域作为初始凸面", true); return; }
+    const name = $("#rf-new-name").value.trim() || `${b.name}·减版流程`;
     try {
       RF.flow = await api(`/api/projects/${App.project.id}/flows`, "POST", {
-        source_block_id: b.id, name,
+        source_block_id: b.id, zone_ids: ids, name,
       });
       RF.currentFlowId = RF.flow.id;
+      $("#rf-create-box").style.display = "none";
       await loadFlowList(RF.flow.id);
-      toast("流程已建立,初始凸面为该色版区域快照");
+      toast(`流程已建立,初始凸面为选中的 ${ids.length} 个区域快照`);
     } catch (e) { toast(e.message, true); }
   });
 
