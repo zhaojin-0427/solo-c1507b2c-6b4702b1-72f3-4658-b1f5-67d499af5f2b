@@ -46,6 +46,7 @@ async function openProject(id) {
   RF.selectedStageId = null; RF.working = []; RF.maskImgs = {};
   loadSketch();
   refreshAllPanels();
+  initJigForProject();
 }
 
 function initTabs() {
@@ -57,6 +58,7 @@ function initTabs() {
       $(`#tab-${btn.dataset.tab}`).classList.add("active");
       redrawAll();
       if (btn.dataset.tab === "export") renderCalibrationPage();
+      if (btn.dataset.tab === "jig") redrawJig();
     });
   });
 }
@@ -98,6 +100,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   initTrialTab();
   initPlanTab();
   initReductionTab();
+  initJigTab();
   initExportTab();
   window.addEventListener("resize", redrawAll);
   const rows = await loadProjectList();

@@ -24,7 +24,8 @@
   <button class="tab" data-tab="trial">⑤ 试印校准</button>
   <button class="tab" data-tab="order">⑥ 版序优化</button>
   <button class="tab" data-tab="reduction">⑦ 减版刻印流程</button>
-  <button class="tab" data-tab="export">⑧ 输出</button>
+  <button class="tab" data-tab="jig">⑧ 定位板</button>
+  <button class="tab" data-tab="export">⑨ 输出</button>
 </nav>
 
 <main>
@@ -223,7 +224,64 @@
     </div>
   </section>
 
-  <!-- ⑧ 输出 -->
+  <!-- ⑧ 定位板 -->
+  <section id="tab-jig" class="tab-pane">
+    <div class="side">
+      <div class="panel">
+        <h2>定位板</h2>
+        <p class="hint">把各色版的三点套准标记扩展为<b>一个角定位槽 + 一个侧定位槽</b>的实体定位板。
+          画布上可直接拖动槽位与木版;「试放纸张」可拖动/Alt 旋转纸张,检查最坏套准包络。</p>
+        <label>已保存版本 <select id="jig-select"></select></label>
+        <div class="btn-row">
+          <button id="btn-jig-save">保存为新版本</button>
+          <button id="btn-jig-reset" class="secondary">恢复默认</button>
+          <button id="btn-jig-del" class="danger">删除版本</button>
+        </div>
+        <h3>台面 / 木版 / 纸张 (mm,台面系坐标)</h3>
+        <div class="form-grid" id="jig-dims-form"></div>
+        <h3>角定位槽</h3>
+        <div id="jig-corner-form"></div>
+        <h3>侧定位槽</h3>
+        <div id="jig-side-form"></div>
+        <h3>误差与搜索</h3>
+        <div class="form-grid" id="jig-tol-form"></div>
+        <div class="btn-row">
+          <button id="btn-jig-search">搜索侧槽位置与装纸方向</button>
+        </div>
+        <label>搜索步长 (mm) <input id="jig-step" type="number" min="1" max="50" step="1" value="5"></label>
+      </div>
+      <div class="panel">
+        <h2>检查与候选</h2>
+        <div id="jig-metrics" class="hint"></div>
+        <ul id="jig-issues" class="plain-list"></ul>
+        <table class="data-table" id="jig-cand-table">
+          <thead><tr><th>#</th><th>侧槽</th><th>位置</th><th>方向</th><th>超限</th><th>最大错位</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="btn-row">
+          <button id="btn-jig-adopt" class="secondary">采纳当前方案并同步各版标记</button>
+        </div>
+        <h3>出图</h3>
+        <div class="btn-row">
+          <button id="btn-jig-slot-page" class="secondary">1:1 开槽图</button>
+          <button id="btn-jig-load-page" class="secondary">装纸检查页</button>
+        </div>
+      </div>
+    </div>
+    <div class="canvas-wrap" style="flex:1">
+      <div class="rf-view-row">
+        <label class="rf-check"><input type="checkbox" id="jig-show-envelope" checked> 最坏包络</label>
+        <label class="rf-check"><input type="checkbox" id="jig-show-marks" checked> 同步标记</label>
+        <label class="rf-check"><input type="checkbox" id="jig-trial"> 试放纸张</label>
+        <button id="btn-jig-seat" class="secondary" type="button">纸张回位到槽</button>
+        <span id="jig-drag-info" class="tag"></span>
+      </div>
+      <canvas id="jig-canvas"></canvas>
+      <div id="jig-legend" class="rf-issues hint"></div>
+    </div>
+  </section>
+
+  <!-- ⑨ 输出 -->
   <section id="tab-export" class="tab-pane">
     <div class="panel">
       <h2>逐版镜像转印图</h2>
@@ -248,6 +306,7 @@
 <script src="/static/js/trial.js"></script>
 <script src="/static/js/plan.js"></script>
 <script src="/static/js/reduction.js"></script>
+<script src="/static/js/jig.js"></script>
 <script src="/static/js/main.js"></script>
 </body>
 </html>

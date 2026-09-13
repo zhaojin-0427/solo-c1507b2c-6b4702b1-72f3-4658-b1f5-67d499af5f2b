@@ -88,6 +88,15 @@ CREATE TABLE IF NOT EXISTS reduction_flows (
   snapshot TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
+CREATE TABLE IF NOT EXISTS jig_boards (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  config TEXT NOT NULL,
+  metrics TEXT NOT NULL DEFAULT '{}',
+  adopted INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
 CREATE TABLE IF NOT EXISTS reduction_stages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   flow_id INTEGER NOT NULL REFERENCES reduction_flows(id) ON DELETE CASCADE,
@@ -1227,6 +1236,472 @@ def delete_stage(sid):
     db.commit()
     flow, rows = recompute_flow(fid)
     return jsonify(flow_to_dict(flow, rows))
+
+
+# ---------------------------------------------------------------- 定位板 API
+
+JIG_SCALE = 2.0          # 槽口/图形重叠栅格化分辨率 px/mm
+DEFAULT_MARK_INSET = 8.0  # 同步套准标记距裁切纸边的内缩 mm
+DEFAULT_SEARCH_STEP = 5.0
+
+# 角定位槽可选的靠边方向 → (角点偏移, 两条邻边定义)
+# 每条邻边: 外法向 n(指向纸外)、自角点沿边的切向 t
+JIG_CORNERS = {
+    "bottom-left": {
+        "point": (0.0, 1.0),
+        "edges": {
+            "left":   {"n": (-1, 0), "t": (0, -1), "len": "h"},
+            "bottom": {"n": (0, 1),  "t": (1, 0),  "len": "w"},
+        },
+    },
+    "bottom-right": {
+        "point": (1.0, 1.0),
+        "edges": {
+            "right":  {"n": (1, 0),  "t": (0, -1), "len": "h"},
+            "bottom": {"n": (0, 1),  "t": (-1, 0), "len": "w"},
+        },
+    },
+    "top-left": {
+        "point": (0.0, 0.0),
+        "edges": {
+            "left": {"n": (-1, 0), "t": (0, 1), "len": "h"},
+            "top":  {"n": (0, -1), "t": (1, 0), "len": "w"},
+        },
+    },
+    "top-right": {
+        "point": (1.0, 0.0),
+        "edges": {
+            "right": {"n": (1, 0), "t": (0, 1),  "len": "h"},
+            "top":   {"n": (0, -1), "t": (-1, 0), "len": "w"},
+        },
+    },
+}
+
+CORNER_LABELS = {"bottom-left": "左下角", "bottom-right": "右下角",
+                 "top-left": "左上角", "top-right": "右上角"}
+EDGE_LABELS = {"left": "左边", "right": "右边", "top": "上边", "bottom": "下边"}
+LOAD_LABELS = {"diag": "双向靠紧", "push_x": "横向推入", "push_y": "纵向推入"}
+
+
+def default_jig_config(proj):
+    """按项目成品纸尺寸给出可直接评估的定位板初值:
+    裁切纸每边大 15mm,台面再大一圈,木版比成品区每边大 10mm。"""
+    pw, ph = proj["paper_w"], proj["paper_h"]
+    if proj["orientation"] == "landscape":
+        pw, ph = ph, pw
+    m = 15.0
+    cut_w, cut_h = pw + 2 * m, ph + 2 * m
+    px, py = 30.0, 30.0
+    return {
+        "table_w": cut_w + 60, "table_h": cut_h + 60,
+        "paper_x": px, "paper_y": py, "paper_w": cut_w, "paper_h": cut_h,
+        "fin_x": px + m, "fin_y": py + m, "fin_w": pw, "fin_h": ph,
+        "block_x": px + m - 10, "block_y": py + m - 10,
+        "block_w": pw + 20, "block_h": ph + 20,
+        "corner": {"edge": "bottom-left", "width": 40, "depth": 8,
+                   "gap": 1.0, "locked": 0},
+        # 默认侧槽放在长边、尽量靠远端,以获得最长力臂
+        "side": {"edge": "left", "pos": round(ph + 2 * m - 22, 1),
+                 "width": 30, "depth": 8, "gap": 1.0},
+        "cut_error": 1.0, "max_skew_deg": 0.6, "lever_min_ratio": 0.4,
+        "mark_inset": DEFAULT_MARK_INSET,
+        "load_mode": "diag",
+    }
+
+
+def _merge_config(base, over):
+    """用前端提交值覆盖默认/已存配置(仅取白名单字段,子表合并)。"""
+    cfg = json.loads(json.dumps(base))
+    over = over or {}
+    for k, v in over.items():
+        if k in ("corner", "side") and isinstance(v, dict):
+            cfg[k].update(v)
+        elif k in cfg:
+            cfg[k] = v
+    return cfg
+
+
+def jig_rects(cfg):
+    """返回定位板几何要素:(纸, 成品区, 木版, 角点, 邻边表, 角槽矩形[2], 侧槽矩形)。
+    槽口矩形:槽口从纸边向外(外法向)先留装纸间隙 gap,再取 depth 深、沿切向 width 宽。"""
+    px, py, pw, ph = cfg["paper_x"], cfg["paper_y"], cfg["paper_w"], cfg["paper_h"]
+    paper = (px, py, pw, ph)
+    fin = (cfg["fin_x"], cfg["fin_y"], cfg["fin_w"], cfg["fin_h"])
+    block = (cfg["block_x"], cfg["block_y"], cfg["block_w"], cfg["block_h"])
+    cspec = JIG_CORNERS[cfg["corner"]["edge"]]
+    pcx = px + cspec["point"][0] * pw
+    pcy = py + cspec["point"][1] * ph
+
+    def slot_rect(edge_name, s0, s1, gap, depth):
+        e = cspec["edges"][edge_name]
+        nx, ny, tx, ty = e["n"][0], e["n"][1], e["t"][0], e["t"][1]
+        xa = min(pcx + gap * nx + s0 * tx, pcx + (gap + depth) * nx + s1 * tx)
+        xb = max(pcx + gap * nx + s0 * tx, pcx + (gap + depth) * nx + s1 * tx)
+        ya = min(pcy + gap * ny + s0 * ty, pcy + (gap + depth) * ny + s1 * ty)
+        yb = max(pcy + gap * ny + s0 * ty, pcy + (gap + depth) * ny + s1 * ty)
+        return (xa, ya, xb - xa, yb - ya)
+
+    co = cfg["corner"]
+    corner_rects = [slot_rect(en, 0.0, float(co["width"]),
+                              float(co["gap"]), float(co["depth"]))
+                    for en in cspec["edges"]]
+    so = cfg["side"]
+    side_rect = None
+    if so.get("edge") in cspec["edges"]:
+        half = float(so["width"]) / 2
+        side_rect = slot_rect(so["edge"], float(so["pos"]) - half,
+                              float(so["pos"]) + half, float(so["gap"]), float(so["depth"]))
+    edge_len = (pw if cspec["edges"][so["edge"]]["len"] == "w" else ph) \
+        if side_rect else 0.0
+    return {"paper": paper, "fin": fin, "block": block,
+            "corner_point": (pcx, pcy), "corner_def": cspec,
+            "corner_rects": corner_rects, "side_rect": side_rect,
+            "side_edge_len": edge_len}
+
+
+def rect_inter(a, b):
+    x = max(a[0], b[0]); y = max(a[1], b[1])
+    r = min(a[0] + a[2], b[0] + b[2]); t = min(a[1] + a[3], b[1] + b[3])
+    if r <= x or t <= y:
+        return 0.0
+    return (r - x) * (t - y)
+
+
+def rect_in_table(r, tw, th, eps=0.01):
+    return r[0] >= -eps and r[1] >= -eps and r[0] + r[2] <= tw + eps and r[1] + r[3] <= th + eps
+
+
+def jig_envelope(cfg, geom, load_mode=None):
+    """最坏套准包络参数:平移预算 t(mm)、偏斜角 θ(rad)、角点枢轴。
+    t 由 裁纸误差 + 未靠紧方向上的角槽/侧槽间隙 合成(按 x/y 分量取模);
+    偏斜直接取设定的装纸偏斜上限,另由力臂算出几何可达偏斜供力臂检查。"""
+    mode = load_mode or cfg.get("load_mode", "diag")
+    seat_x = mode in ("diag", "push_x")
+    seat_y = mode in ("diag", "push_y")
+    co, so = cfg["corner"], cfg["side"]
+    side_normal_axis = None
+    if geom["side_rect"]:
+        n = geom["corner_def"]["edges"][so["edge"]]["n"]
+        side_normal_axis = "x" if n[0] != 0 else "y"
+    cut = float(cfg["cut_error"])
+    gx = 0.0 if seat_x else float(co["gap"])
+    gy = 0.0 if seat_y else float(co["gap"])
+    if not seat_x and side_normal_axis == "x":
+        gx += float(so["gap"])
+    if not seat_y and side_normal_axis == "y":
+        gy += float(so["gap"])
+    t = math.hypot(cut + gx, cut + gy)
+    theta_cfg = math.radians(float(cfg["max_skew_deg"]))
+    L = float(so["pos"]) if geom["side_rect"] else 0.0
+    clear = float(co["gap"]) + float(so["gap"]) + cut
+    theta_geom = math.atan(clear / L) if L > 1e-6 else math.pi / 2
+    # 力臂越长,间隙能转化出的偏斜越小;实际最坏偏斜取设定上限与几何可达值的小者
+    theta = min(theta_cfg, theta_geom)
+    return {"t": t, "theta": theta, "pivot": geom["corner_point"],
+            "theta_geom": theta_geom, "lever": L}
+
+
+def evaluate_jig(proj, cfg, tolerance=None):
+    """把 裁纸误差/槽口间隙/装纸偏斜 换算为各区域最坏错位,并汇总全部检查项。"""
+    cfg = _merge_config(default_jig_config(proj), cfg)
+    geom = jig_rects(cfg)
+    env = jig_envelope(cfg, geom)
+    theta, (pcx, pcy), t = env["theta"], env["pivot"], env["t"]
+    skew_k = 2 * math.sin(theta / 2)
+
+    # 区域最坏错位:设计坐标(成品区系)→ 板坐标,绕角槽角点偏斜 + 整体平移
+    region_disps = []
+    max_disp = 0.0
+    over_count = 0
+    art_polys = []
+    for b in proj["blocks"]:
+        for ri, r in enumerate(b["regions"]):
+            d = 0.0
+            bpts = []
+            for p in r["points"]:
+                bx = cfg["fin_x"] + p[0]
+                by = cfg["fin_y"] + p[1]
+                bpts.append((bx, by))
+                dist = math.hypot(bx - pcx, by - pcy)
+                d = max(d, t + skew_k * dist)
+            art_polys.append(bpts)
+            region_disps.append({"block_id": b["id"], "block_name": b["name"],
+                                 "region": ri + 1, "disp": round(d, 3)})
+            max_disp = max(max_disp, d)
+            if tolerance is not None and d > tolerance:
+                over_count += 1
+    region_disps.sort(key=lambda z: -z["disp"])
+
+    # 栅格化域:纸/木版/槽口的总外接框
+    allrects = [geom["paper"], geom["block"]] + geom["corner_rects"]
+    if geom["side_rect"]:
+        allrects.append(geom["side_rect"])
+    bx0 = min(r[0] for r in allrects)
+    by0 = min(r[1] for r in allrects)
+    bx1 = max(r[0] + r[2] for r in allrects)
+    by1 = max(r[1] + r[3] for r in allrects)
+    W = max(1, round((bx1 - bx0) * JIG_SCALE))
+    H = max(1, round((by1 - by0) * JIG_SCALE))
+
+    def shifted(polys):
+        return [[(p[0] - bx0, p[1] - by0) for p in pts] for pts in polys]
+
+    art_bits = rasterize_polys(shifted(art_polys), W, H, JIG_SCALE)
+    cell = (1.0 / JIG_SCALE) ** 2
+
+    def rect_bits(r):
+        return rasterize_polys([[(r[0], r[1]), (r[0] + r[2], r[1]),
+                                 (r[0] + r[2], r[1] + r[3]), (r[0], r[1] + r[3])]],
+                               W, H, JIG_SCALE)
+
+    issues = []
+    slot_rects = geom["corner_rects"] + ([geom["side_rect"]] if geom["side_rect"] else [])
+    # ① 槽口压图形 / 压纸张 / 压木版
+    names = ["角槽·" + EDGE_LABELS.get(en, en) for en in geom["corner_def"]["edges"]]
+    if geom["side_rect"]:
+        names.append("侧槽·" + EDGE_LABELS.get(cfg["side"]["edge"], cfg["side"]["edge"]))
+    for name, r in zip(names, slot_rects):
+        a_art = (art_bits & rect_bits(r)).bit_count() * cell
+        if a_art > 0.5:
+            issues.append({"type": "slot_art", "blocking": True,
+                           "text": f"{name}槽口压住印刷图形约 {a_art:.1f} mm²,会蹭脏画面或挡版"})
+        if rect_inter(r, geom["paper"]) > 1e-6:
+            issues.append({"type": "slot_paper", "blocking": True,
+                           "text": f"{name}槽口伸入裁切纸边缘(装纸间隙为负),纸张无法落位"})
+        if rect_inter(r, geom["block"]) > 1e-6:
+            issues.append({"type": "slot_block", "blocking": True,
+                           "text": f"{name}槽口与木版投影重叠,木版无法平整落台"})
+        if not rect_in_table(r, cfg["table_w"], cfg["table_h"]):
+            issues.append({"type": "slot_table", "blocking": True,
+                           "text": f"{name}槽口越出台面"})
+
+    # ② 纸张 / 木版越出台面
+    if not rect_in_table(geom["paper"], cfg["table_w"], cfg["table_h"]):
+        issues.append({"type": "paper_table", "blocking": True,
+                       "text": "裁切纸越出台面范围,无法平放"})
+    if not rect_in_table(geom["block"], cfg["table_w"], cfg["table_h"]):
+        issues.append({"type": "block_table", "blocking": True,
+                       "text": "木版越出台面范围"})
+    # 成品区不在裁切纸内(警告)
+    if rect_inter(geom["fin"], geom["paper"]) + 0.01 < geom["fin"][2] * geom["fin"][3]:
+        issues.append({"type": "fin_paper", "blocking": False,
+                       "text": "成品区未完全落在裁切纸内,裁切余量不足"})
+
+    # ③ 侧槽力臂 / 位置
+    so = cfg["side"]
+    if not geom["side_rect"]:
+        issues.append({"type": "side_edge", "blocking": True,
+                       "text": f"侧槽靠边「{so['edge']}」不经过角槽{CORNER_LABELS[cfg['corner']['edge']]}"})
+    else:
+        elen = geom["side_edge_len"]
+        L = env["lever"]
+        half = float(so["width"]) / 2
+        if L - half < 0 or L + half > elen + 0.01:
+            issues.append({"type": "side_range", "blocking": True,
+                           "text": f"侧槽超出纸边(位置 {L:.0f} ± {half:.0f} mm,边长 {elen:.0f} mm)"})
+        ratio = float(cfg["lever_min_ratio"])
+        if L < ratio * elen:
+            issues.append({"type": "lever_short", "blocking": False,
+                           "text": f"侧槽力臂过短:距角点 {L:.0f} mm < 边长 {elen:.0f} mm 的 {ratio:.0%}"
+                                   f"(建议 ≥ {ratio * elen:.0f} mm)"})
+        if env["theta_geom"] > theta:
+            issues.append({"type": "lever_skew", "blocking": False,
+                           "text": f"按当前间隙与力臂,装纸偏斜最坏可达 {math.degrees(env['theta_geom']):.2f}°"
+                                   f",超过设定的 {cfg['max_skew_deg']:.2f}°(力臂 {L:.0f} mm 偏短)"})
+
+    blocking = sum(1 for i in issues if i["blocking"])
+    warnings = len(issues) - blocking
+    return {
+        "issues": issues, "blocking_count": blocking, "warning_count": warnings,
+        "over_count": over_count, "max_disp": round(max_disp, 3),
+        "region_disps": region_disps[:20],
+        "envelope": {"t": round(t, 3), "theta_deg": cfg["max_skew_deg"],
+                     "theta_geom_deg": round(math.degrees(env["theta_geom"]), 3),
+                     "lever": round(env["lever"], 1)},
+        "footprint": {"x": round(bx0, 1), "y": round(by0, 1),
+                      "w": round(bx1 - bx0, 1), "h": round(by1 - by0, 1),
+                      "area": round((bx1 - bx0) * (by1 - by0), 0)},
+    }
+
+
+def jig_search(proj, cfg, tolerance, step=DEFAULT_SEARCH_STEP):
+    """锁定角槽,枚举侧槽位置 × 邻边 × 装纸方向,按
+    超限区域数 → 阻断问题数 → 最大错位 → 占板面积 排序。"""
+    cfg = _merge_config(default_jig_config(proj), cfg)
+    cands = []
+    edges = list(JIG_CORNERS[cfg["corner"]["edge"]]["edges"].keys())
+    for edge in edges:
+        elen = (cfg["paper_w"] if JIG_CORNERS[cfg["corner"]["edge"]]["edges"][edge]["len"] == "w"
+                else cfg["paper_h"])
+        half = float(cfg["side"]["width"]) / 2
+        ratio = float(cfg["lever_min_ratio"])
+        lo = max(half + 1, ratio * elen)
+        hi = elen - half - 1
+        pos = lo
+        while pos <= hi + 1e-6:
+            for mode in ("diag", "push_x", "push_y"):
+                trial = json.loads(json.dumps(cfg))
+                trial["side"]["edge"] = edge
+                trial["side"]["pos"] = round(pos, 1)
+                trial["load_mode"] = mode
+                m = evaluate_jig(proj, trial, tolerance)
+                if m["blocking_count"]:
+                    pos += step
+                    continue
+                cands.append({
+                    "side_edge": edge, "side_pos": round(pos, 1),
+                    "load_mode": mode,
+                    "over_count": m["over_count"],
+                    "blocking_count": m["blocking_count"],
+                    "warning_count": m["warning_count"],
+                    "max_disp": m["max_disp"],
+                    "footprint_area": m["footprint"]["area"],
+                    "footprint": m["footprint"],
+                    "theta_geom_deg": m["envelope"]["theta_geom_deg"],
+                    "config": trial, "metrics": m,
+                })
+            pos += step
+    cands.sort(key=lambda c: (c["over_count"], c["blocking_count"],
+                              c["max_disp"], c["footprint_area"]))
+    return cands[:30]
+
+
+def jig_to_dict(r):
+    d = {"id": r["id"], "project_id": r["project_id"], "name": r["name"],
+         "config": json.loads(r["config"]), "metrics": json.loads(r["metrics"] or "{}"),
+         "adopted": bool(r["adopted"]), "created_at": r["created_at"]}
+    return d
+
+
+def jig_sync_marks(cfg):
+    """采纳方案 → 三块版统一的 3 个套准标记(裁切纸局部坐标):
+    角点内缩、侧槽接触点内缩、对角点内缩。返回 (成品区设计坐标, 裁切纸坐标)。"""
+    px, py, pw, ph = cfg["paper_x"], cfg["paper_y"], cfg["paper_w"], cfg["paper_h"]
+    inset = float(cfg.get("mark_inset", DEFAULT_MARK_INSET))
+    cspec = JIG_CORNERS[cfg["corner"]["edge"]]
+    qx, qy = cspec["point"]
+    corner_cut = [px + (inset if qx == 0 else pw - inset),
+                  py + (inset if qy == 0 else ph - inset)]
+    # 对角
+    opp_cut = [px + (inset if qx == 1 else pw - inset),
+               py + (inset if qy == 1 else ph - inset)]
+    # 侧槽:沿边距角点 pos,再内缩 inset
+    e = cspec["edges"][cfg["side"]["edge"]]
+    L = float(cfg["side"]["pos"])
+    sx = px + qx * pw + e["t"][0] * L - e["n"][0] * inset
+    sy = py + qy * ph + e["t"][1] * L - e["n"][1] * inset
+    side_cut = [sx, sy]
+    cut_pts = [corner_cut, side_cut, opp_cut]
+    # 转成品区设计坐标
+    design_pts = [[round(x - (cfg["fin_x"] - px), 2), round(y - (cfg["fin_y"] - py), 2)]
+                  for x, y in cut_pts]
+    return design_pts
+
+
+@app.get("/api/projects/<int:pid>/jigs")
+def list_jigs(pid):
+    rows = get_db().execute(
+        "SELECT * FROM jig_boards WHERE project_id=? ORDER BY id DESC", (pid,)).fetchall()
+    return jsonify([jig_to_dict(r) for r in rows])
+
+
+@app.post("/api/projects/<int:pid>/jig-evaluate")
+def jig_evaluate_api(pid):
+    proj = load_project_full(pid)
+    data = request.get_json(force=True) or {}
+    tol = data.get("tolerance")
+    return jsonify(evaluate_jig(proj, data.get("config") or {},
+                                float(tol) if tol is not None else None))
+
+
+@app.post("/api/projects/<int:pid>/jig-search")
+def jig_search_api(pid):
+    proj = load_project_full(pid)
+    data = request.get_json(force=True) or {}
+    tol = data.get("tolerance")
+    if tol is None:
+        abort(400, "请先给定允许错位 (mm)")
+    cands = jig_search(proj, data.get("config") or {}, float(tol),
+                       float(data.get("step") or DEFAULT_SEARCH_STEP))
+    return jsonify({"total": len(cands), "candidates": cands})
+
+
+@app.post("/api/projects/<int:pid>/jigs")
+def create_jig(pid):
+    proj = load_project_full(pid)
+    data = request.get_json(force=True) or {}
+    cfg = _merge_config(default_jig_config(proj), data.get("config") or {})
+    tol = data.get("tolerance")
+    metrics = evaluate_jig(proj, cfg, float(tol) if tol is not None else None)
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO jig_boards(project_id,name,config,metrics) VALUES(?,?,?,?)",
+        (pid, (data.get("name") or f"定位板方案").strip(),
+         json.dumps(cfg, ensure_ascii=False),
+         json.dumps(metrics, ensure_ascii=False)))
+    db.commit()
+    row = db.execute("SELECT * FROM jig_boards WHERE id=?", (cur.lastrowid,)).fetchone()
+    return jsonify(jig_to_dict(row)), 201
+
+
+@app.get("/api/jigs/<int:jid>")
+def get_jig(jid):
+    r = get_db().execute("SELECT * FROM jig_boards WHERE id=?", (jid,)).fetchone()
+    if not r:
+        abort(404, "定位板版本不存在")
+    return jsonify(jig_to_dict(r))
+
+
+@app.put("/api/jigs/<int:jid>")
+def update_jig(jid):
+    db = get_db()
+    row = db.execute("SELECT * FROM jig_boards WHERE id=?", (jid,)).fetchone()
+    if not row:
+        abort(404, "定位板版本不存在")
+    data = request.get_json(force=True) or {}
+    proj = load_project_full(row["project_id"])
+    cfg = json.loads(row["config"])
+    if "config" in data:
+        cfg = _merge_config(cfg, data["config"])
+    name = (data.get("name") or row["name"]).strip()
+    metrics = evaluate_jig(proj, cfg)
+    db.execute("UPDATE jig_boards SET name=?,config=?,metrics=? WHERE id=?",
+               (name, json.dumps(cfg, ensure_ascii=False),
+                json.dumps(metrics, ensure_ascii=False), jid))
+    db.commit()
+    return jsonify(jig_to_dict(db.execute(
+        "SELECT * FROM jig_boards WHERE id=?", (jid,)).fetchone()))
+
+
+@app.delete("/api/jigs/<int:jid>")
+def delete_jig(jid):
+    get_db().execute("DELETE FROM jig_boards WHERE id=?", (jid,))
+    get_db().commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/jigs/<int:jid>/adopt")
+def adopt_jig(jid):
+    """采纳定位板方案:版本置为当前,并把统一的三点套准标记写回各版
+    (历史试印记录 trials 不动)。"""
+    db = get_db()
+    row = db.execute("SELECT * FROM jig_boards WHERE id=?", (jid,)).fetchone()
+    if not row:
+        abort(404, "定位板版本不存在")
+    cfg = json.loads(row["config"])
+    proj = load_project_full(row["project_id"])
+    metrics = evaluate_jig(proj, cfg)
+    marks = jig_sync_marks(cfg)
+    db.execute("UPDATE jig_boards SET adopted=0 WHERE project_id=?", (row["project_id"],))
+    db.execute("UPDATE jig_boards SET adopted=1,metrics=? WHERE id=?",
+               (json.dumps(metrics, ensure_ascii=False), jid))
+    for b in proj["blocks"]:
+        db.execute("UPDATE blocks SET reg_marks=? WHERE id=?",
+                   (json.dumps(marks), b["id"]))
+    db.commit()
+    return jsonify({"jig": jig_to_dict(db.execute(
+        "SELECT * FROM jig_boards WHERE id=?", (jid,)).fetchone()),
+        "synced_marks": marks})
 
 
 if __name__ == "__main__":

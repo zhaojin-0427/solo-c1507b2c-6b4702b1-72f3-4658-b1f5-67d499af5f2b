@@ -149,3 +149,14 @@ footer { text-align: center; font-size: 12px; color: #8a7f6a; padding: 14px; }
 .rf-create .rf-zones { max-height: 170px; overflow: auto; margin: 4px 0; }
 .rf-create .rf-zones label { display: flex; gap: 5px; align-items: center; }
 .rf-create .rf-zones input { width: auto; }
+
+/* ⑧ 定位板 */
+#tab-jig .canvas-wrap { display: flex; flex-direction: column; align-items: stretch; }
+#tab-jig .rf-view-row { margin-bottom: 8px; }
+#jig-canvas { align-self: center; }
+#jig-metrics {
+  background: #fbf8ef; border: 1px solid var(--line); border-radius: 6px;
+  padding: 8px 10px; margin: 6px 0; line-height: 1.7;
+}
+#jig-drag-info { margin-left: auto; }
+#jig-cand-table button { padding: 3px 8px; }
