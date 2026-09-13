@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>套色木刻工作台</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header>
+  <h1>套色木刻工作台</h1>
+  <div id="project-bar">
+    <select id="project-select"></select>
+    <button id="btn-new-project">新建项目</button>
+    <button id="btn-del-project" class="danger">删除项目</button>
+  </div>
+</header>
+
+<nav id="tabs">
+  <button class="tab active" data-tab="setup">① 项目与色版</button>
+  <button class="tab" data-tab="draw">② 区域勾勒</button>
+  <button class="tab" data-tab="preview">③ 合成预览与检测</button>
+  <button class="tab" data-tab="register">④ 套准模拟</button>
+  <button class="tab" data-tab="trial">⑤ 试印校准</button>
+  <button class="tab" data-tab="order">⑥ 版序优化</button>
+  <button class="tab" data-tab="reduction">⑦ 减版刻印流程</button>
+  <button class="tab" data-tab="export">⑧ 输出</button>
+</nav>
+
+<main>
+  <!-- ① 项目与色版设置 -->
+  <section id="tab-setup" class="tab-pane active">
+    <div class="panel">
+      <h2>项目设置</h2>
+      <div class="form-grid">
+        <label>项目名称 <input id="proj-name" type="text"></label>
+        <label>纸宽 (mm) <input id="proj-pw" type="number" min="50" step="1"></label>
+        <label>纸高 (mm) <input id="proj-ph" type="number" min="50" step="1"></label>
+        <label>纸张方向
+          <select id="proj-orient">
+            <option value="portrait">竖向</option>
+            <option value="landscape">横向</option>
+          </select>
+        </label>
+        <label>底稿导入 <input id="sketch-file" type="file" accept="image/*"></label>
+        <label>底稿不透明度 <input id="sketch-opacity" type="range" min="0" max="1" step="0.05" value="0.35"></label>
+      </div>
+      <button id="btn-save-project">保存项目设置</button>
+    </div>
+    <div class="panel">
+      <h2>色版(2～8 块)</h2>
+      <button id="btn-add-block">＋ 添加色版</button>
+      <div id="block-list"></div>
+    </div>
+  </section>
+
+  <!-- ② 区域勾勒 -->
+  <section id="tab-draw" class="tab-pane">
+    <div class="side">
+      <div class="panel">
+        <h2>勾勒区域</h2>
+        <p class="hint">选择色版后,在画布上逐点单击勾勒封闭区域;至少 3 点后点击「闭合区域」。</p>
+        <label>当前色版 <select id="draw-block-select"></select></label>
+        <div class="btn-row">
+          <button id="btn-close-region">闭合区域</button>
+          <button id="btn-undo-point">撤销点</button>
+          <button id="btn-clear-draft">清空草稿</button>
+        </div>
+        <div class="btn-row">
+          <button id="btn-delete-region" class="danger">删除选中区域</button>
+        </div>
+        <label>区域目标色 <input id="region-target" type="color" value="#1a1a1a"></label>
+        <button id="btn-set-region-target">设置选中区域目标色</button>
+        <h3>已勾勒区域</h3>
+        <ul id="region-list" class="plain-list"></ul>
+      </div>
+    </div>
+    <div class="canvas-wrap"><canvas id="draw-canvas"></canvas></div>
+  </section>
+
+  <!-- ③ 合成预览与检测 -->
+  <section id="tab-preview" class="tab-pane">
+    <div class="side">
+      <div class="panel">
+        <h2>合成预览</h2>
+        <label><input type="checkbox" id="pv-show-sketch" checked> 显示底稿</label>
+        <label><input type="checkbox" id="pv-show-issues" checked> 高亮问题区域</label>
+        <button id="btn-run-detect">运行检测</button>
+        <h3>问题清单</h3>
+        <ul id="issue-list" class="plain-list"></ul>
+      </div>
+    </div>
+    <div class="canvas-wrap"><canvas id="preview-canvas"></canvas></div>
+  </section>
+
+  <!-- ④ 套准模拟 -->
+  <section id="tab-register" class="tab-pane">
+    <div class="side">
+      <div class="panel">
+        <h2>套准模拟</h2>
+        <p class="hint">选择色版后,在画布上<b>拖动</b>模拟横纵偏移,按住 <b>Alt</b> 拖动模拟旋转;也可用下方数值微调。</p>
+        <label>模拟色版 <select id="reg-block-select"></select></label>
+        <div class="form-grid">
+          <label>横向偏移 (mm) <input id="reg-dx" type="number" step="0.1"></label>
+          <label>纵向偏移 (mm) <input id="reg-dy" type="number" step="0.1"></label>
+          <label>旋转 (°) <input id="reg-rot" type="number" step="0.1"></label>
+        </div>
+        <button id="btn-reset-offset">复位该版偏移</button>
+        <h3>各目标区域最大错位</h3>
+        <table class="data-table" id="misreg-table">
+          <thead><tr><th>区域</th><th>所属版</th><th>最大错位 (mm)</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="canvas-wrap"><canvas id="register-canvas"></canvas></div>
+  </section>
+
+  <!-- ⑤ 试印校准 -->
+  <section id="tab-trial" class="tab-pane">
+    <div class="side">
+      <div class="panel">
+        <h2>试印校准</h2>
+        <label>试印色版 <select id="trial-block-select"></select></label>
+        <p class="hint">在画布上依次点击 3 个套准标记的<b>设计位置</b>,再手工填入试印件上量得的<b>实测坐标</b>。</p>
+        <button id="btn-pick-design">从画布拾取设计坐标</button>
+        <table class="data-table" id="trial-table">
+          <thead><tr><th>标记</th><th>设计 X</th><th>设计 Y</th><th>实测 X</th><th>实测 Y</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td><input data-m="0" data-k="dx"></td><td><input data-m="0" data-k="dy"></td><td><input data-m="0" data-k="mx"></td><td><input data-m="0" data-k="my"></td></tr>
+            <tr><td>2</td><td><input data-m="1" data-k="dx"></td><td><input data-m="1" data-k="dy"></td><td><input data-m="1" data-k="mx"></td><td><input data-m="1" data-k="my"></td></tr>
+            <tr><td>3</td><td><input data-m="2" data-k="dx"></td><td><input data-m="2" data-k="dy"></td><td><input data-m="2" data-k="mx"></td><td><input data-m="2" data-k="my"></td></tr>
+          </tbody>
+        </table>
+        <button id="btn-solve-trial">解算修正并记录</button>
+        <div id="trial-result"></div>
+        <div class="btn-row">
+          <button id="btn-apply-corr">应用修正到该版</button>
+          <button id="btn-toggle-overlay">叠加修正前后轮廓</button>
+        </div>
+        <h3>试印记录</h3>
+        <ul id="trial-list" class="plain-list"></ul>
+      </div>
+    </div>
+    <div class="canvas-wrap"><canvas id="trial-canvas"></canvas></div>
+  </section>
+
+  <!-- ⑥ 版序优化 -->
+  <section id="tab-order" class="tab-pane">
+    <div class="panel">
+      <h2>版序优化</h2>
+      <p class="hint">勾选「锁定印次」的色版保持当前印次不动,其余版参与枚举。结果按 目标混色误差 → 清墨换色次数 → 干燥等待次数 排序。</p>
+      <table class="data-table" id="lock-table">
+        <thead><tr><th>印次</th><th>色版</th><th>油墨</th><th>干燥规则</th><th>锁定印次</th><th>锁定修正</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <button id="btn-enumerate">枚举剩余版序</button>
+      <h3>候选方案(前 50)</h3>
+      <table class="data-table" id="order-table">
+        <thead><tr><th>#</th><th>版序</th><th>混色误差</th><th>换色次数</th><th>干燥等待</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <h3>已保存方案</h3>
+      <ul id="plan-list" class="plain-list"></ul>
+    </div>
+  </section>
+
+  <!-- ⑦ 减版刻印流程 -->
+  <section id="tab-reduction" class="tab-pane">
+    <div class="side">
+      <div class="panel">
+        <h2>减版刻印流程</h2>
+        <p class="hint">同一块实体木版的连续刻印阶段:每遍先在<b>剩余凸面</b>上着墨印刷,再刻掉本轮区域。
+          已印阶段及此前刻掉的区域不可恢复。</p>
+        <label>当前流程 <select id="rf-flow-select"></select></label>
+        <div class="btn-row">
+          <button id="btn-rf-new">从色版建立流程</button>
+          <button id="btn-rf-del" class="danger">删除流程</button>
+        </div>
+        <div id="rf-create-box" class="rf-create" style="display:none">
+          <label>来源色版
+            <select id="rf-new-block"></select>
+          </label>
+          <div class="hint">勾选作为初始凸面的色版区域(即纸面与套准标记沿用该版设置):</div>
+          <div id="rf-new-zones" class="rf-zones"></div>
+          <div class="marks-row">
+            <button id="btn-rf-zones-all" class="secondary" type="button">全选</button>
+            <button id="btn-rf-zones-none" class="secondary" type="button">清空</button>
+          </div>
+          <label>流程名称 <input id="rf-new-name" type="text" style="width:100%"></label>
+          <div class="btn-row">
+            <button id="btn-rf-create-ok">建立流程</button>
+            <button id="btn-rf-create-cancel" class="secondary">取消</button>
+          </div>
+        </div>
+        <div id="rf-meta" class="hint"></div>
+        <h3>阶段列表</h3>
+        <ul id="rf-stage-list" class="plain-list"></ul>
+        <button id="btn-rf-add-stage">＋ 在上一阶段副本中新建草稿</button>
+      </div>
+      <div class="panel" id="rf-editor-panel">
+        <h2>阶段编辑</h2>
+        <div id="rf-editor"></div>
+      </div>
+    </div>
+    <div class="canvas-wrap" style="flex:1">
+      <div class="rf-slider-row">
+        <span>阶段滑杆</span>
+        <input id="rf-slider" type="range" min="0" max="0" step="1" value="0" style="flex:1">
+        <span id="rf-slider-label" class="tag"></span>
+      </div>
+      <div class="rf-view-row">
+        <label class="rf-check"><input type="checkbox" id="rf-show-sketch" checked> 底稿</label>
+        <label class="rf-check"><input type="checkbox" id="rf-show-relief"> 剩余凸面</label>
+        <label class="rf-check"><input type="checkbox" id="rf-show-narrow" checked> 窄线/窄桥</label>
+        <label class="rf-check"><input type="checkbox" id="rf-show-inkzones"> 着墨区</label>
+        <label class="rf-check"><input type="checkbox" id="rf-highlight" checked> 高亮新刻区</label>
+        <label class="rf-check"><input type="checkbox" id="rf-show-poly" checked> 刻除多边形</label>
+        <label class="rf-check"><input type="checkbox" id="rf-mirror"> 镜像视图(同木面)</label>
+      </div>
+      <canvas id="reduction-canvas"></canvas>
+      <div id="rf-issues" class="rf-issues"></div>
+    </div>
+  </section>
+
+  <!-- ⑧ 输出 -->
+  <section id="tab-export" class="tab-pane">
+    <div class="panel">
+      <h2>逐版镜像转印图</h2>
+      <p class="hint">每块版输出一张水平镜像的转印图(含套准标记与版名),用于反贴木版转印。</p>
+      <div id="transfer-list"></div>
+      <button id="btn-all-transfers">下载全部转印图</button>
+    </div>
+    <div class="panel">
+      <h2>套准校准页</h2>
+      <p class="hint">汇总纸张框线、全部套准标记、各版修正量与当前版序,可打印后随版存档。</p>
+      <button id="btn-calibration-page">生成并打印校准页</button>
+      <div class="canvas-wrap"><canvas id="calib-canvas"></canvas></div>
+    </div>
+  </section>
+</main>
+
+<footer>套色木刻工作台 · Flask + SQLite · 数据保存于本机 woodcut.db</footer>
+
+<script src="/static/js/common.js"></script>
+<script src="/static/js/editor.js"></script>
+<script src="/static/js/preview.js"></script>
+<script src="/static/js/trial.js"></script>
+<script src="/static/js/plan.js"></script>
+<script src="/static/js/reduction.js"></script>
+<script src="/static/js/main.js"></script>
+</body>
+</html>
