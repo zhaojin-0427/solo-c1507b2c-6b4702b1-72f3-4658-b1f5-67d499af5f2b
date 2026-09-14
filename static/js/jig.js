@@ -123,24 +123,31 @@ function jigEnvelope(cfg, geom, loadMode) {
     pivot: geom.cornerPoint };
 }
 
-/* 采纳后同步给各版的 3 点标记(成品区设计坐标),镜像后端 jig_sync_marks */
+/* 采纳后同步给各版的 3 点标记(成品区/设计纸坐标),镜像后端 jig_sync_marks。
+   三点都保证落在 0..fin_w × 0..fin_h 设计纸内。 */
 function jigSyncMarks(cfg) {
-  const { paper_x: px, paper_y: py, paper_w: pw, paper_h: ph } = cfg;
-  const inset = +cfg.mark_inset;
+  const w = +cfg.fin_w, h = +cfg.fin_h;
+  const inset = Math.min(+cfg.mark_inset, w / 3, h / 3);
   const cdef = JG_CORNERS[cfg.corner.edge];
   const [qx, qy] = cdef.point;
-  const cut = [
-    [px + (qx === 0 ? inset : pw - inset), py + (qy === 0 ? inset : ph - inset)],
-    [px + (qx === 1 ? inset : pw - inset), py + (qy === 1 ? inset : ph - inset)],
-  ];
+  const corner = [qx === 0 ? inset : w - inset, qy === 0 ? inset : h - inset];
+  const opp = [qx === 0 ? w - inset : inset, qy === 0 ? h - inset : inset];
+  // 侧槽:裁切纸系距角点 pos → 减该角处沿切向的裁切余量,夹到设计边长内
+  const px = +cfg.paper_x, py = +cfg.paper_y, pw = +cfg.paper_w, ph = +cfg.paper_h;
+  const fx = qx === 0 ? +cfg.fin_x : +cfg.fin_x + w;
+  const fy = qy === 0 ? +cfg.fin_y : +cfg.fin_y + h;
+  const cxp = qx === 0 ? px : px + pw;
+  const cyp = qy === 0 ? py : py + ph;
   const e = cdef.edges[cfg.side.edge];
-  const L = +cfg.side.pos;
-  cut.splice(1, 0, [
-    px + qx * pw + e.t[0] * L - e.n[0] * inset,
-    py + qy * ph + e.t[1] * L - e.n[1] * inset,
-  ]);
-  const mx = cfg.fin_x - px, my = cfg.fin_y - py;
-  return cut.map(([x, y]) => [+((x - mx)).toFixed(2), +((y - my)).toFixed(2)]);
+  const [tx, ty] = e.t;
+  const marginS = (fx - cxp) * tx + (fy - cyp) * ty;
+  const edgeLen = e.len === "w" ? w : h;
+  let s = +cfg.side.pos - marginS;
+  // 夹到设计边长内,且与角点/对角点各留 2·inset 间距,避免三点重合;边过短取中点
+  const lo = 3 * inset, hi = edgeLen - 3 * inset;
+  s = hi < lo ? edgeLen / 2 : Math.min(Math.max(s, lo), hi);
+  const side = [corner[0] + tx * (s - inset), corner[1] + ty * (s - inset)];
+  return [corner, side, opp].map(([x, y]) => [+x.toFixed(2), +y.toFixed(2)]);
 }
 
 function pointInRect(x, y, r, pad = 0) {

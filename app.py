@@ -1574,28 +1574,37 @@ def jig_to_dict(r):
 
 
 def jig_sync_marks(cfg):
-    """采纳方案 → 三块版统一的 3 个套准标记(裁切纸局部坐标):
-    角点内缩、侧槽接触点内缩、对角点内缩。返回 (成品区设计坐标, 裁切纸坐标)。"""
-    px, py, pw, ph = cfg["paper_x"], cfg["paper_y"], cfg["paper_w"], cfg["paper_h"]
-    inset = float(cfg.get("mark_inset", DEFAULT_MARK_INSET))
+    """采纳方案 → 三块版统一的 3 个套准标记(成品区/设计纸坐标,mm)。
+    标记必须落在设计纸 0..fin_w × 0..fin_h 内才能被各色版直接使用:
+      M1 角槽角点:从设计纸两条边各内缩 mark_inset;
+      M2 侧槽点:法向同样内缩,沿边位置取 (侧槽距角点 − 裁切余量) 并夹回设计边长;
+      M3 对角点:从对角两边内缩。"""
+    w, h = float(cfg["fin_w"]), float(cfg["fin_h"])
+    inset = min(float(cfg.get("mark_inset", DEFAULT_MARK_INSET)), w / 3.0, h / 3.0)
     cspec = JIG_CORNERS[cfg["corner"]["edge"]]
     qx, qy = cspec["point"]
-    corner_cut = [px + (inset if qx == 0 else pw - inset),
-                  py + (inset if qy == 0 else ph - inset)]
-    # 对角
-    opp_cut = [px + (inset if qx == 1 else pw - inset),
-               py + (inset if qy == 1 else ph - inset)]
-    # 侧槽:沿边距角点 pos,再内缩 inset
+    corner = [inset if qx == 0 else w - inset,
+              inset if qy == 0 else h - inset]
+    opp = [w - inset if qx == 0 else inset,
+           h - inset if qy == 0 else inset]
+    # 侧槽:沿边距角点 pos(裁切纸系)→ 设计纸系减该角处的裁切余量,夹到设计边长内
+    px, py, pw, ph = (float(cfg["paper_x"]), float(cfg["paper_y"]),
+                      float(cfg["paper_w"]), float(cfg["paper_h"]))
+    fx = cfg["fin_x"] if qx == 0 else cfg["fin_x"] + w
+    fy = cfg["fin_y"] if qy == 0 else cfg["fin_y"] + h
+    cxp = px if qx == 0 else px + pw
+    cyp = py if qy == 0 else py + ph
     e = cspec["edges"][cfg["side"]["edge"]]
-    L = float(cfg["side"]["pos"])
-    sx = px + qx * pw + e["t"][0] * L - e["n"][0] * inset
-    sy = py + qy * ph + e["t"][1] * L - e["n"][1] * inset
-    side_cut = [sx, sy]
-    cut_pts = [corner_cut, side_cut, opp_cut]
-    # 转成品区设计坐标
-    design_pts = [[round(x - (cfg["fin_x"] - px), 2), round(y - (cfg["fin_y"] - py), 2)]
-                  for x, y in cut_pts]
-    return design_pts
+    tx, ty = e["t"]
+    margin_s = (fx - cxp) * tx + (fy - cyp) * ty
+    edge_len = w if e["len"] == "w" else h
+    s = float(cfg["side"]["pos"]) - margin_s
+    # 夹到设计边长内,且与角点/对角点各留 2·inset 间距,避免三点重合;过短则取中点
+    lo, hi = 3 * inset, edge_len - 3 * inset
+    s = edge_len / 2 if hi < lo else min(max(s, lo), hi)
+    tx, ty = e["t"]
+    side = [corner[0] + tx * (s - inset), corner[1] + ty * (s - inset)]
+    return [[round(x, 2), round(y, 2)] for x, y in (corner, side, opp)]
 
 
 @app.get("/api/projects/<int:pid>/jigs")
