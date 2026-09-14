@@ -122,6 +122,42 @@ CREATE TABLE IF NOT EXISTS reduction_stages (
   confirmed_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
+-- 多张试印稳定性分析批次:建立时冻结项目色版/标记快照,确认后冻结来源标记、测量与结果
+CREATE TABLE IF NOT EXISTS trial_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'collecting',  -- collecting 采集中 / confirmed 已确认
+  snapshot TEXT NOT NULL DEFAULT '{}',       -- 色版 id/名称/油墨/3 标记坐标快照
+  results TEXT NOT NULL DEFAULT '{}',        -- 最近一次分析结果(确认时刻冻结)
+  applied_log TEXT NOT NULL DEFAULT '[]',    -- 建议修正写入色版的操作记录
+  confirmed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS trial_sheets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL REFERENCES trial_batches(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,                      -- 印刷顺序 0..n-1
+  name TEXT NOT NULL DEFAULT '',
+  printed_at TEXT NOT NULL DEFAULT '',       -- 印刷时间(文本)
+  feed TEXT NOT NULL DEFAULT 'normal',       -- normal 正常 / turn180 调头180 / flip 翻面
+  trusted INTEGER NOT NULL DEFAULT 0,        -- 锁定可信印张
+  excluded INTEGER NOT NULL DEFAULT 0,       -- 注明原因排除该张全部测次
+  exclude_reason TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS trial_measures (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sheet_id INTEGER NOT NULL REFERENCES trial_sheets(id) ON DELETE CASCADE,
+  block_id INTEGER,                           -- 快照色版 id(色版删除后保留测量)
+  mark_index INTEGER NOT NULL,               -- 0/1/2
+  mx REAL NOT NULL,
+  my REAL NOT NULL,
+  excluded INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_measure_unique
+  ON trial_measures(sheet_id, block_id, mark_index);
 """
 
 MIN_BLOCKS, MAX_BLOCKS = 2, 8
@@ -659,6 +695,779 @@ def list_trials(pid):
         d["correction"] = json.loads(d["correction"])
         out.append(d)
     return jsonify(out)
+
+
+# ---------------------------------------------------------------- 多张试印稳定性分析 API
+
+BATCH_MIN_SHEETS, BATCH_MAX_SHEETS = 3, 30
+FEED_LABELS = {"normal": "正常进纸", "turn180": "调头 180°", "flip": "翻面进纸"}
+
+# 异常判定阈值(毫米 / 度 / 缩放比)
+OUTLIER_FLOOR_MM = 0.4       # 离群残差下限:max(3·MADσ, 该值)
+JUMP_T_MM = 0.6              # 版位平移突变下限
+JUMP_ROT_DEG = 0.15          # 旋转突变下限
+JUMP_SCALE = 0.005           # 缩放突变下限 0.5%
+DRIFT_STEP_T = 0.05          # 连续漂移:单步最小变化
+DRIFT_STEP_ROT = 0.01
+DRIFT_STEP_SCALE = 0.0002
+DRIFT_TOTAL_T = 0.2          # 连续漂移:整段累计变化下限
+DRIFT_TOTAL_ROT = 0.05
+DRIFT_TOTAL_SCALE = 0.002
+MISREG_WARN_MM = 0.5         # 版间套准差提示
+
+
+def median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+def r3(v):
+    return round(float(v), 3)
+
+
+def batch_snapshot(proj):
+    """从项目色版与套准标记建立批次快照(确认后分析始终读此快照,色版事后修改不影响)。"""
+    blocks = []
+    for i, b in enumerate(proj["blocks"]):
+        marks = []
+        for m in b["reg_marks"][:3]:
+            if isinstance(m, dict) and isinstance(m.get("x"), (int, float)):
+                marks.append([float(m["x"]), float(m["y"])])
+            else:
+                marks = []
+                break
+        if len(marks) != 3:
+            abort(400, f"色版「{b['name']}」尚未填齐 3 个套准标记,无法建立批次快照")
+        blocks.append({"id": b["id"], "seq": i, "name": b["name"],
+                       "ink_color": b["ink_color"], "marks": marks})
+    if len(blocks) < MIN_BLOCKS:
+        abort(400, f"至少需要 {MIN_BLOCKS} 块色版")
+    return {"blocks": blocks, "paper_w": proj["paper_w"], "paper_h": proj["paper_h"],
+            "project_name": proj["name"], "frozen_at": now_ts()}
+
+
+def load_batch_or_404(bid):
+    r = get_db().execute("SELECT * FROM trial_batches WHERE id=?", (bid,)).fetchone()
+    if not r:
+        abort(404, "试印批次不存在")
+    return r
+
+
+def batch_measures(db, sheet_ids):
+    """按 sheet_id 收集测次:{sid: {block_id: {mark_index: (mx,my,excluded,reason,mid)}}}"""
+    out = {sid: {} for sid in sheet_ids}
+    if not sheet_ids:
+        return out
+    qmarks = ",".join("?" * len(sheet_ids))
+    for r in db.execute(
+            f"SELECT * FROM trial_measures WHERE sheet_id IN ({qmarks})", sheet_ids):
+        out[r["sheet_id"]].setdefault(r["block_id"], {})[r["mark_index"]] = {
+            "mx": r["mx"], "my": r["my"], "excluded": bool(r["excluded"]),
+            "reason": r["reason"], "id": r["id"]}
+    return out
+
+
+def fit_common_similarity(pairs):
+    """pairs: [(设计 p, 实测 q)]。整体最小二乘拟合 q ≈ s·R·p + t(中心化,供逐版求平移)。
+    返回 (A分量 c,sn, 设计质心, 实测质心, su2, 满秩)。"""
+    n = len(pairs)
+    if n < 3:
+        # 采集过程中测点可能不足(单张试印接口另用 fit_similarity 的 400 校验)
+        return 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, False
+    px = sum(p[0][0] for p in pairs) / n
+    py = sum(p[0][1] for p in pairs) / n
+    qx = sum(p[1][0] for p in pairs) / n
+    qy = sum(p[1][1] for p in pairs) / n
+    a = bv = su2 = 0.0
+    for (pxi, pyi), (qxi, qyi) in pairs:
+        ux, uy = pxi - px, pyi - py
+        vx, vy = qxi - qx, qyi - qy
+        a += ux * vx + uy * vy
+        bv += ux * vy - uy * vx
+        su2 += ux * ux + uy * uy
+    # 满秩判据:参与点的设计坐标至少覆盖两个不共线方向(同一标记被多版重复测量
+    # 只提供一个设计位置):3 个不同标记且不共线,或 ≥2 个不同标记且有足够分离
+    pset = list({(round(p[0][0], 4), round(p[0][1], 4)) for p in pairs})
+    full_rank = su2 > 1e-6 and len(pset) >= 2
+    if full_rank and len(pset) >= 3:
+        (x0, y0), (x1, y1), (x2, y2) = pset[0], pset[1], pset[2]
+        full_rank = abs((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)) > 1e-6
+    elif full_rank:
+        # 仅两个不同设计点:旋转不可定,判为不可解(提示需要更多测点)
+        full_rank = False
+    theta = math.atan2(bv, a)
+    s = math.hypot(a, bv) / su2 if su2 > 1e-9 else 1.0
+    c, sn = s * math.cos(theta), s * math.sin(theta)
+    return c, sn, px, py, qx, qy, s, math.degrees(theta), su2 > 1e-9 and full_rank
+
+
+def analyze_batch(snap, sheets, measures_by_sheet, trusted_seqs):
+    """分离同一印张共有的缩放/旋转与各色版平移;逐张残差、版间差;
+    沿印刷顺序检出连续漂移、突变、离群测点与漏测;以中位数汇总建议修正。"""
+    blocks = snap["blocks"]
+    marks_of = {b["id"]: b["marks"] for b in blocks}
+    name_of = {b["id"]: b["name"] for b in blocks}
+    issues = []
+
+    def issue(itype, level, text, ref=None):
+        issues.append({"type": itype, "level": level, "text": text,
+                       "ref": ref or {}})
+
+    sheet_results = []
+    for sh in sheets:
+        seq = sh["seq"]
+        res = {"seq": seq, "name": sh["name"] or f"第{seq + 1}张",
+               "printed_at": sh["printed_at"], "feed": sh["feed"],
+               "trusted": seq in trusted_seqs,
+               "excluded_sheet": bool(sh["excluded"]),
+               "exclude_reason": sh["exclude_reason"],
+               "fittable": False, "excluded": []}
+        if sh["excluded"]:
+            # 注明原因排除的整张拉:不入拟合/统计,但保留在时间轴上可见
+            res["reason"] = f"本张已排除:{sh['exclude_reason'] or '未注明原因'}"
+            issue("sheet_excluded", "info",
+                  f"{res['name']}:整张已排除({sh['exclude_reason'] or '未注明原因'})",
+                  {"kind": "sheet", "sheet_seq": seq})
+            sheet_results.append(res)
+            continue
+        msm = measures_by_sheet.get(sh["id"], {})
+        # 每版:有效(未排除)测点配对;排除测点另行登记用于展示
+        per_block, excluded_pts = {}, []
+        for bid, pts in msm.items():
+            if bid not in marks_of:
+                continue
+            pairs = []
+            for mi, z in pts.items():
+                if z["excluded"]:
+                    excluded_pts.append({"block_id": bid, "mark_index": mi,
+                                         "reason": z["reason"]})
+                elif 0 <= mi < 3:
+                    pairs.append((marks_of[bid][mi], [z["mx"], z["my"]]))
+            per_block[bid] = pairs
+        res["excluded"] = excluded_pts
+
+        total = sum(len(v) for v in per_block.values())
+        n_blocks_measured = sum(1 for v in per_block.values() if v)
+        res["n_points"] = total
+
+        if total == 0:
+            res["reason"] = "本张尚未录入任何实测点"
+            issue("unmeasured", "info", f"{res['name']}:尚未录入任何实测点(漏测整张)",
+                  {"kind": "sheet", "sheet_seq": seq})
+            sheet_results.append(res)
+            continue
+
+        # 测点键 (block_id, mark_index) → (设计 p, 实测 q)
+        keyed = {}
+        for bid, pairs in per_block.items():
+            for k, (dp, qp) in enumerate(pairs):
+                mi = marks_of[bid].index(dp)
+                keyed[(bid, mi)] = (dp, qp)
+        keys = list(keyed)
+
+        def pass_fit(use_keys):
+            """给定测点键 → (共性 A=(c,sn), scale, rot, 每版平移, 每键残差向量)。
+            共性 A 由全部测点共同最小二乘拟合;每版平移取该版**可用测点**处
+            「实测 − A·设计」分量的中位数,故个别漏测/坏点不会偏置版位。"""
+            pairs_in = [keyed[k] for k in use_keys]
+            c, sn = fit_common_similarity(pairs_in)[:2]
+            scale, rot = fit_common_similarity(pairs_in)[6:8]
+            txb, resid = {}, {}
+            for bid, pairs in per_block.items():
+                ks = [k for k in use_keys if k[0] == bid]
+                if not ks:
+                    continue
+                tbx = median([keyed[k][1][0]
+                              - (c * keyed[k][0][0] - sn * keyed[k][0][1]) for k in ks])
+                tby = median([keyed[k][1][1]
+                              - (sn * keyed[k][0][0] + c * keyed[k][0][1]) for k in ks])
+                txb[bid] = [tbx, tby]
+                for k in ks:
+                    dp, qp = keyed[k]
+                    resid[k] = (c * dp[0] - sn * dp[1] + tbx - qp[0],
+                                sn * dp[0] + c * dp[1] + tby - qp[1])
+            return c, sn, scale, rot, txb, resid
+
+        if not fit_common_similarity([keyed[k] for k in keys])[8]:
+            res["reason"] = "测点设计位置共线/重合,测点不足,无法分离缩放旋转与平移"
+            issue("unfittable", "warn",
+                  f"{res['name']}:有效测点不足或共线({total} 点),无法解算"
+                  f"——至少需要同版 3 点或两版各 2 点",
+                  {"kind": "sheet", "sheet_seq": seq})
+            sheet_results.append(res)
+            continue
+
+        # 第一趟:全点拟合,由残差分布定离群阈值并标注离群测点
+        c0, sn0, scale0, rot0, txb0, resid0 = pass_fit(keys)
+        mags0 = [math.hypot(*v) for v in resid0.values()]
+        med_mag = median(mags0)
+        sig = 1.4826 * median([abs(z - med_mag) for z in mags0])
+        out_thr = max(3 * sig, OUTLIER_FLOOR_MM)
+        out_keys = {k for k in keys if math.hypot(*resid0[k]) > out_thr}
+
+        # 第二趟:剔除离群点后重拟共性变换(避免单个坏点把误差吸进旋转/缩放);
+        # 剔完不满秩则退回第一趟。离群点残差保留第一趟原值以便定位;
+        # 某版因剔除后不再参与共性拟合时,其版位平移沿用第一趟
+        clean = [k for k in keys if k not in out_keys]
+        if out_keys and clean and fit_common_similarity([keyed[k] for k in clean])[8]:
+            cf, csn, scale, rot_deg, txb, resid_final = pass_fit(clean)
+            for bid in txb0:
+                txb.setdefault(bid, txb0[bid])
+        else:
+            cf, csn, scale, rot_deg, txb, resid_final = c0, sn0, scale0, rot0, txb0, resid0
+        tx_by = {b: [r3(v[0]), r3(v[1])] for b, v in txb.items()}
+
+        # 漏测 / 未测版登记(平移来自全部 3 标记,漏测不影响版位)
+        missing_map, absent = {}, []
+        for bid, pairs in per_block.items():
+            dmarks = marks_of[bid]
+            if pairs:
+                got = [p[0] for p in pairs]
+                miss = [mi for mi, dp in enumerate(dmarks) if dp not in got]
+                if miss:
+                    missing_map[bid] = miss
+                    issue("missing", "info",
+                          f"{res['name']} · {name_of[bid]}:标记 "
+                          f"{','.join('M' + str(i + 1) for i in miss)} 漏测",
+                          {"kind": "mark", "sheet_seq": seq, "block_id": bid,
+                           "mark_index": miss[0]})
+            else:
+                absent.append(bid)
+        if absent and len(absent) < len(blocks):
+            issue("absent_block", "info",
+                  f"{res['name']}:色版 {','.join(name_of[b] for b in absent)} 未测量",
+                  {"kind": "sheet", "sheet_seq": seq, "block_id": absent[0],
+                   "mark_index": 0})
+
+        # 逐测点残差:好点取第二趟,离群点取第一趟
+        residual_list = []
+        for k in keys:
+            bid, mi = k
+            rx, ry = resid0[k] if k in out_keys else resid_final[k]
+            z = {"block_id": bid, "mark_index": mi,
+                 "rx": r3(rx), "ry": r3(ry), "mag": r3(math.hypot(rx, ry))}
+            if k in out_keys:
+                z["outlier"] = True
+                issue("outlier", "warn",
+                      f"{res['name']} · {name_of[bid]} · M{mi + 1}:"
+                      f"残差 {z['mag']:.2f} mm 超过阈值 {out_thr:.2f}(疑似离群测点)",
+                      {"kind": "point", "sheet_seq": seq,
+                       "block_id": bid, "mark_index": mi})
+            residual_list.append(z)
+        mags = [z["mag"] for z in residual_list]
+
+        # 版间套准差:以印有测点的第一版(快照顺序)为基准,逐版平移差
+        ref_bid = next((b["id"] for b in blocks if b["id"] in tx_by), None)
+        misreg = []
+        for bid in tx_by:
+            if bid == ref_bid:
+                continue
+            dx = tx_by[bid][0] - tx_by[ref_bid][0]
+            dy = tx_by[bid][1] - tx_by[ref_bid][1]
+            mag = math.hypot(dx, dy)
+            misreg.append({"block_id": bid, "ref_block_id": ref_bid,
+                           "dx": r3(dx), "dy": r3(dy), "mag": r3(mag)})
+            if mag > MISREG_WARN_MM:
+                issue("misreg", "warn",
+                      f"{res['name']} · {name_of[bid]} 相对 {name_of[ref_bid]}:"
+                      f"版间套准差 {mag:.2f} mm",
+                      {"kind": "block", "sheet_seq": seq, "block_id": bid})
+
+        if n_blocks_measured == 1:
+            only = next(name_of[b] for b, v in per_block.items() if v)
+            issue("single_block", "info",
+                  f"{res['name']}:只测了「{only}」一版,共性缩放/旋转与残差无法交叉校核",
+                  {"kind": "sheet", "sheet_seq": seq})
+
+        res.update({"fittable": True, "scale": r3(scale), "rot_deg": r3(rot_deg),
+                    "tx_by_block": {str(b): v for b, v in tx_by.items()},
+                    "residuals": residual_list, "misreg": misreg,
+                    "missing": {str(b): v for b, v in missing_map.items()},
+                    "absent_blocks": absent, "outlier_threshold": r3(out_thr),
+                    "max_res": r3(max(mags)) if mags else 0.0,
+                    "rms_res": r3(math.sqrt(sum(z * z for z in mags) / len(mags)))
+                    if mags else 0.0})
+        sheet_results.append(res)
+
+    fit_seqs = [r["seq"] for r in sheet_results if r["fittable"]]
+    by_seq = {r["seq"]: r for r in sheet_results}
+
+    # 进纸方向变化(信息,提示突变可能来自调头/翻面)
+    for s1, s2 in zip(sheets, sheets[1:]):
+        if s1["feed"] != s2["feed"]:
+            nm2 = s2["name"] or f"第{s2['seq'] + 1}张"
+            fl1 = FEED_LABELS.get(s1["feed"], s1["feed"])
+            fl2 = FEED_LABELS.get(s2["feed"], s2["feed"])
+            issue("feed_change", "info",
+                  f"{nm2}:进纸方向由「{fl1}」变为「{fl2}」",
+                  {"kind": "sheet", "sheet_seq": s2["seq"]})
+
+    def series_events(key, label, jump_floor, step_min, total_min, block_id=None,
+                      unit=""):
+        """沿印刷顺序对某指标做 突变 与 连续漂移(同号连贯段) 检测。
+        突变步:|Δ| 超过物理下限 floor(单点大跳也会抬高 MAD,故不用 3σ 主判)。"""
+        vals = [(sq, by_seq[sq][key] if block_id is None
+                 else by_seq[sq]["tx_by_block"].get(str(block_id), [None, None])[
+                     0 if key == "tx" else 1])
+                for sq in fit_seqs]
+        vals = [(sq, v) for sq, v in vals if v is not None]
+        if len(vals) < 2:
+            return
+        deltas = [(vals[k][0], vals[k + 1][0], vals[k + 1][1] - vals[k][1])
+                  for k in range(len(vals) - 1)]
+        jump_steps = set()
+        for idx, (s0, s1, d) in enumerate(deltas):
+            if abs(d) > jump_floor:
+                jump_steps.add(idx)
+                who = f"{name_of[block_id]} · " if block_id is not None else ""
+                issue("jump", "warn",
+                      f"第{s1 + 1}张相对第{s0 + 1}张 {who}{label}突变 "
+                      f"{d:+.3f}{unit}(判定下限 {jump_floor:g})",
+                      {"kind": "sheet", "sheet_seq": s1,
+                       "block_id": block_id, "metric": key})
+        # 同号连贯段:相邻已解算印张、同号且单步超 step_min,段含 ≥2 个采样点。
+        # 渐变中的大跳变(已另行报 jump)不切断漂移,两类异常同时可见
+        best = None
+        i = 0
+        while i < len(deltas):
+            sgn = 1 if deltas[i][2] > 0 else -1
+            j = i
+            while (j < len(deltas) and
+                   (deltas[j][2] > 0) - (deltas[j][2] < 0) == sgn
+                   and abs(deltas[j][2]) >= step_min):
+                j += 1
+            if j > i:
+                seg = deltas[i:j]
+                total = sum(d[2] for d in seg)
+                if abs(total) >= total_min and (best is None or abs(total) > abs(best[3])):
+                    best = (seg[0][0], seg[-1][1], sgn, total)
+            i = j + 1 if j > i else i + 1
+        if best:
+            s0, s1, sgn, total = best
+            who = f"{name_of[block_id]} · " if block_id is not None else ""
+            issue("drift", "warn",
+                  f"第{s0 + 1}～{s1 + 1}张 {who}{label}连续{'增大' if sgn > 0 else '减小'}"
+                  f" {total:+.3f}{unit}(疑似连续漂移)",
+                  {"kind": "series", "sheet_seq": s1, "start_seq": s0, "end_seq": s1,
+                   "block_id": block_id, "metric": key})
+
+    if len(fit_seqs) >= 2:
+        series_events("scale", "共性缩放", JUMP_SCALE, DRIFT_STEP_SCALE,
+                      DRIFT_TOTAL_SCALE, None, "")
+        series_events("rot_deg", "共性旋转", JUMP_ROT_DEG, DRIFT_STEP_ROT,
+                      DRIFT_TOTAL_ROT, None, "°")
+        for b in blocks:
+            bid = b["id"]
+            if sum(1 for sq in fit_seqs
+                   if str(bid) in by_seq[sq]["tx_by_block"]) >= 2:
+                series_events("tx", "横向平移", JUMP_T_MM, DRIFT_STEP_T,
+                              DRIFT_TOTAL_T, bid, " mm")
+                series_events("ty", "纵向平移", JUMP_T_MM, DRIFT_STEP_T,
+                              DRIFT_TOTAL_T, bid, " mm")
+
+    # 中位数汇总建议修正:已解算印张中该版有测点者;可信印张必入(其测点不可被排除)
+    suggestions = {}
+    for b in blocks:
+        bid = b["id"]
+        txs = [by_seq[sq]["tx_by_block"][str(bid)] for sq in fit_seqs
+               if str(bid) in by_seq[sq]["tx_by_block"]]
+        if not txs:
+            continue
+        n_trusted = sum(1 for sq in fit_seqs
+                        if sq in trusted_seqs and str(bid) in by_seq[sq]["tx_by_block"])
+        suggestions[str(bid)] = {
+            "tx": r3(median([t[0] for t in txs])),
+            "ty": r3(median([t[1] for t in txs])),
+            "n": len(txs), "n_trusted": n_trusted,
+            "warning": "" if len(txs) >= 3 else f"仅 {len(txs)} 张参与中位数,建议至少 3 张"}
+    scales = [by_seq[sq]["scale"] for sq in fit_seqs]
+    rots = [by_seq[sq]["rot_deg"] for sq in fit_seqs]
+    max_misreg = max((m["mag"] for r in sheet_results if r.get("fittable")
+                      for m in r["misreg"]), default=0.0)
+    summary = {
+        "n_sheets": len(sheets), "n_fittable": len(fit_seqs),
+        "scale_median": r3(median(scales)) if scales else None,
+        "scale_pct": r3((median(scales) - 1) * 100) if scales else None,
+        "rot_median_deg": r3(median(rots)) if rots else None,
+        "max_misreg": r3(max_misreg),
+        "trusted_sheets": sorted(trusted_seqs),
+        "computed_at": now_ts(),
+    }
+    return {"sheets": sheet_results, "issues": issues,
+            "suggestions": suggestions, "summary": summary}
+
+
+def recompute_batch(bid):
+    """重算采集中批次的分析结果并写库;返回 (batch_row, payload)。已确认批次不重算。"""
+    db = get_db()
+    batch = load_batch_or_404(bid)
+    sheets = db.execute(
+        "SELECT * FROM trial_sheets WHERE batch_id=? ORDER BY seq, id", (bid,)).fetchall()
+    measures = batch_measures(db, [s["id"] for s in sheets])
+    snap = json.loads(batch["snapshot"] or "{}")
+    trusted = {s["seq"] for s in sheets if s["trusted"]}
+    payload = analyze_batch(snap, [dict(s) for s in sheets], measures, trusted)
+    if batch["status"] == "collecting":
+        db.execute("UPDATE trial_batches SET results=? WHERE id=?",
+                   (json.dumps(payload, ensure_ascii=False), bid))
+        db.commit()
+        batch = load_batch_or_404(bid)
+    return batch, payload
+
+
+def batch_to_dict(r, payload=None):
+    d = {"id": r["id"], "project_id": r["project_id"], "name": r["name"],
+         "status": r["status"], "snapshot": json.loads(r["snapshot"] or "{}"),
+         "confirmed_at": r["confirmed_at"], "created_at": r["created_at"],
+         "applied_log": json.loads(r["applied_log"] or "[]")}
+    if payload is None:
+        payload = json.loads(r["results"] or "{}")
+    db = get_db()
+    d["sheets"] = [dict(s) for s in db.execute(
+        "SELECT * FROM trial_sheets WHERE batch_id=? ORDER BY seq, id", (r["id"],))]
+    measures = {}
+    for s in d["sheets"]:
+        s["trusted"] = bool(s["trusted"])
+        s["excluded"] = bool(s["excluded"])
+        measures[s["id"]] = [dict(m) for m in db.execute(
+            "SELECT * FROM trial_measures WHERE sheet_id=? ORDER BY block_id,mark_index",
+            (s["id"],))]
+        for m in measures[s["id"]]:
+            m["excluded"] = bool(m["excluded"])
+    d["measures"] = measures
+    d["results"] = payload
+    return d
+
+
+@app.get("/api/projects/<int:pid>/trial-batches")
+def list_trial_batches(pid):
+    rows = get_db().execute(
+        "SELECT * FROM trial_batches WHERE project_id=? ORDER BY id DESC", (pid,)).fetchall()
+    out = []
+    for r in rows:
+        res = json.loads(r["results"] or "{}")
+        n_sheets = get_db().execute(
+            "SELECT COUNT(*) c FROM trial_sheets WHERE batch_id=?", (r["id"],)).fetchone()["c"]
+        out.append({"id": r["id"], "name": r["name"], "status": r["status"],
+                    "n_sheets": n_sheets,
+                    "n_fittable": (res.get("summary") or {}).get("n_fittable", 0),
+                    "n_issues": len(res.get("issues", [])),
+                    "confirmed_at": r["confirmed_at"], "created_at": r["created_at"]})
+    return jsonify(out)
+
+
+@app.post("/api/projects/<int:pid>/trial-batches")
+def create_trial_batch(pid):
+    proj = load_project_full(pid)
+    data = request.get_json(force=True) or {}
+    snap = batch_snapshot(proj)
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO trial_batches(project_id,name,snapshot,results) VALUES(?,?,?,?)",
+        (pid, (data.get("name") or f"{proj['name']}·试印稳定性批次").strip(),
+         json.dumps(snap, ensure_ascii=False),
+         json.dumps({"sheets": [], "issues": [], "suggestions": {},
+                     "summary": {"n_sheets": 0, "n_fittable": 0}})))
+    db.commit()
+    batch, payload = recompute_batch(cur.lastrowid)
+    return jsonify(batch_to_dict(batch, payload)), 201
+
+
+@app.get("/api/trial-batches/<int:bid>")
+def get_trial_batch(bid):
+    batch = load_batch_or_404(bid)
+    payload = json.loads(batch["results"] or "{}")
+    return jsonify(batch_to_dict(batch, payload))
+
+
+@app.put("/api/trial-batches/<int:bid>")
+def update_trial_batch(bid):
+    batch = load_batch_or_404(bid)
+    data = request.get_json(force=True) or {}
+    db = get_db()
+    if "name" in data:
+        db.execute("UPDATE trial_batches SET name=? WHERE id=?",
+                   ((data["name"] or batch["name"]).strip(), bid))
+        db.commit()
+    batch2, payload = recompute_batch(bid)
+    return jsonify(batch_to_dict(batch2, payload))
+
+
+@app.delete("/api/trial-batches/<int:bid>")
+def delete_trial_batch(bid):
+    load_batch_or_404(bid)
+    db = get_db()
+    db.execute("DELETE FROM trial_batches WHERE id=?", (bid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/trial-batches/<int:bid>/confirm")
+def confirm_trial_batch(bid):
+    """确认批次:冻结来源标记、测量与结果。至少 3 张试纸、至多 30 张。"""
+    batch = load_batch_or_404(bid)
+    if batch["status"] != "collecting":
+        abort(409, "批次已确认,来源标记、测量与结果已冻结")
+    db = get_db()
+    n = db.execute("SELECT COUNT(*) c FROM trial_sheets WHERE batch_id=?",
+                   (bid,)).fetchone()["c"]
+    if not BATCH_MIN_SHEETS <= n <= BATCH_MAX_SHEETS:
+        abort(400, f"确认需 {BATCH_MIN_SHEETS}～{BATCH_MAX_SHEETS} 张试纸,当前 {n} 张")
+    batch2, payload = recompute_batch(bid)
+    log = json.loads(batch2["applied_log"] or "[]")
+    log.append({"at": now_ts(), "text": "批次确认:冻结色版标记快照、全部测量与分析结果"})
+    db.execute("UPDATE trial_batches SET status='confirmed',confirmed_at=?,applied_log=? WHERE id=?",
+               (now_ts(), json.dumps(log, ensure_ascii=False), bid))
+    db.commit()
+    return jsonify(batch_to_dict(load_batch_or_404(bid), payload))
+
+
+@app.post("/api/trial-batches/<int:bid>/reopen")
+def reopen_trial_batch(bid):
+    """已确认批次仅允许「重新打开继续采集」:保留既有测量与冻结时刻,重新进入采集中。
+    重新确认会再次冻结(既有试印 trials 记录始终不动)。"""
+    batch = load_batch_or_404(bid)
+    if batch["status"] != "confirmed":
+        abort(409, "仅已确认批次可以重新打开")
+    db = get_db()
+    log = json.loads(batch["applied_log"] or "[]")
+    log.append({"at": now_ts(), "text": "重新打开批次继续采集/补测"})
+    db.execute("UPDATE trial_batches SET status='collecting',confirmed_at=NULL,applied_log=? WHERE id=?",
+               (json.dumps(log, ensure_ascii=False), bid))
+    db.commit()
+    batch2, payload = recompute_batch(bid)
+    return jsonify(batch_to_dict(batch2, payload))
+
+
+@app.post("/api/trial-batches/<int:bid>/sheets")
+def add_trial_sheet(bid):
+    batch = load_batch_or_404(bid)
+    if batch["status"] != "collecting":
+        abort(409, "批次已确认冻结,请先「重新打开」再追加试纸")
+    db = get_db()
+    n = db.execute("SELECT COUNT(*) c FROM trial_sheets WHERE batch_id=?",
+                   (bid,)).fetchone()["c"]
+    if n >= BATCH_MAX_SHEETS:
+        abort(400, f"每批次最多 {BATCH_MAX_SHEETS} 张试纸")
+    data = request.get_json(force=True) or {}
+    feed = data.get("feed", "normal")
+    if feed not in FEED_LABELS:
+        abort(400, "进纸方向应为 normal / turn180 / flip")
+    seq = int(data.get("seq", n))
+    seq = max(0, min(seq, n))
+    if seq < n:
+        db.execute("UPDATE trial_sheets SET seq=seq+1 WHERE batch_id=? AND seq>=?",
+                   (bid, seq))
+    cur = db.execute(
+        "INSERT INTO trial_sheets(batch_id,seq,name,printed_at,feed,trusted,note)"
+        " VALUES(?,?,?,?,?,?,?)",
+        (bid, seq, (data.get("name") or "").strip(),
+         data.get("printed_at", "").strip(), feed,
+         1 if data.get("trusted") else 0, data.get("note", "").strip()))
+    db.commit()
+    batch2, payload = recompute_batch(bid)
+    return jsonify(batch_to_dict(batch2, payload)), 201
+
+
+def _editable_sheet(sid):
+    db = get_db()
+    s = db.execute("SELECT * FROM trial_sheets WHERE id=?", (sid,)).fetchone()
+    if not s:
+        abort(404, "试纸不存在")
+    batch = load_batch_or_404(s["batch_id"])
+    if batch["status"] != "collecting":
+        abort(409, "批次已确认冻结,试纸不可修改(可重新打开批次)")
+    return db, batch, s
+
+
+@app.put("/api/trial-sheets/<int:sid>")
+def update_trial_sheet(sid):
+    db, batch, s = _editable_sheet(sid)
+    data = request.get_json(force=True) or {}
+    fields, vals = [], []
+    for k in ("name", "printed_at", "note"):
+        if k in data:
+            fields.append(f"{k}=?"); vals.append(data[k])
+    if "feed" in data:
+        if data["feed"] not in FEED_LABELS:
+            abort(400, "进纸方向应为 normal / turn180 / flip")
+        fields.append("feed=?"); vals.append(data["feed"])
+    if "trusted" in data:
+        fields.append("trusted=?"); vals.append(1 if data["trusted"] else 0)
+        if data["trusted"]:
+            # 可信印张与排除互斥:锁定可信即取消整张拉排除标记
+            fields.append("excluded=?"); vals.append(0)
+            fields.append("exclude_reason=?"); vals.append("")
+    if "excluded" in data:
+        ex = 1 if data["excluded"] else 0
+        if ex and s["trusted"] and "trusted" not in data:
+            abort(409, "该印张已锁定为可信印张,不能排除(请先取消可信锁定)")
+        fields.append("excluded=?"); vals.append(ex)
+        fields.append("exclude_reason=?")
+        vals.append((data.get("exclude_reason", "") or "").strip() if ex else "")
+        if ex:
+            fields.append("trusted=?"); vals.append(0)
+    if "seq" in data:
+        new_seq = max(0, min(int(data["seq"]),
+                             db.execute("SELECT COUNT(*) c FROM trial_sheets WHERE batch_id=?",
+                                        (s["batch_id"],)).fetchone()["c"] - 1))
+        db.execute("UPDATE trial_sheets SET seq=seq-1 WHERE batch_id=? AND seq>? AND seq<=?",
+                   (s["batch_id"], s["seq"], new_seq))
+        db.execute("UPDATE trial_sheets SET seq=seq+1 WHERE batch_id=? AND seq<? AND seq>=?",
+                   (s["batch_id"], s["seq"], new_seq))
+        fields.append("seq=?"); vals.append(new_seq)
+    if fields:
+        vals.append(sid)
+        db.execute(f"UPDATE trial_sheets SET {', '.join(fields)} WHERE id=?", vals)
+        db.commit()
+    batch2, payload = recompute_batch(s["batch_id"])
+    return jsonify(batch_to_dict(batch2, payload))
+
+
+@app.delete("/api/trial-sheets/<int:sid>")
+def delete_trial_sheet(sid):
+    db, batch, s = _editable_sheet(sid)
+    bid = s["batch_id"]
+    db.execute("DELETE FROM trial_sheets WHERE id=?", (sid,))
+    db.execute("UPDATE trial_sheets SET seq=seq-1 WHERE batch_id=? AND seq>?",
+               (bid, s["seq"]))
+    db.commit()
+    batch2, payload = recompute_batch(bid)
+    return jsonify(batch_to_dict(batch2, payload))
+
+
+@app.put("/api/trial-measures/<int:mid>")
+def update_trial_measure(mid):
+    """注明原因排除测次(或取消排除);可信印张的测点不可排除。"""
+    db = get_db()
+    m = db.execute("SELECT * FROM trial_measures WHERE id=?", (mid,)).fetchone()
+    if not m:
+        abort(404, "测次不存在")
+    s = db.execute("SELECT * FROM trial_sheets WHERE id=?", (m["sheet_id"],)).fetchone()
+    batch = load_batch_or_404(s["batch_id"])
+    if batch["status"] != "collecting":
+        abort(409, "批次已确认冻结,测次不可修改(可重新打开批次)")
+    data = request.get_json(force=True) or {}
+    excluded = 1 if data.get("excluded") else 0
+    if excluded and s["trusted"]:
+        abort(409, "该印张已锁定为可信印张,其测点不能排除(请先取消可信锁定)")
+    reason = data.get("reason", m["reason"]) if excluded else ""
+    db.execute("UPDATE trial_measures SET excluded=?,reason=? WHERE id=?",
+               (excluded, reason, mid))
+    db.commit()
+    batch2, payload = recompute_batch(s["batch_id"])
+    return jsonify(batch_to_dict(batch2, payload))
+
+
+@app.post("/api/trial-sheets/<int:sid>/measures")
+def upsert_trial_measure(sid):
+    """录入/更新一张试纸上某色版某标记的实测坐标。body:
+    {block_id, mark_index, mx, my}(已存在则覆盖;可信印张仍允许补录但不能排除)。"""
+    db, batch, s = _editable_sheet(sid)
+    data = request.get_json(force=True) or {}
+    bid = data.get("block_id")
+    mi = int(data.get("mark_index", -1))
+    snap = json.loads(batch["snapshot"])
+    if not any(b["id"] == bid for b in snap["blocks"]):
+        abort(400, "该色版不在批次快照中")
+    if not 0 <= mi <= 2:
+        abort(400, "标记序号应为 0/1/2")
+    try:
+        mx, my = float(data["mx"]), float(data["my"])
+    except (TypeError, ValueError):
+        abort(400, "实测坐标必须是数字")
+    snap_b = next(b for b in snap["blocks"] if b["id"] == bid)
+    dx, dy = snap_b["marks"][mi]
+    pw, ph = float(snap["paper_w"]), float(snap["paper_h"])
+    if not (-20 <= mx <= pw + 20 and -20 <= my <= ph + 20):
+        abort(400, f"实测点 ({mx:.1f},{my:.1f}) 超出纸面 {pw:g}×{ph:g} mm 容许范围")
+    old = db.execute(
+        "SELECT id FROM trial_measures WHERE sheet_id=? AND block_id=? AND mark_index=?",
+        (sid, bid, mi)).fetchone()
+    if old:
+        db.execute("UPDATE trial_measures SET mx=?,my=?,excluded=0,reason='' WHERE id=?",
+                   (mx, my, old["id"]))
+    else:
+        db.execute(
+            "INSERT INTO trial_measures(sheet_id,block_id,mark_index,mx,my) VALUES(?,?,?,?,?)",
+            (sid, bid, mi, mx, my))
+    db.commit()
+    batch2, payload = recompute_batch(s["batch_id"])
+    return jsonify(batch_to_dict(batch2, payload))
+
+
+@app.delete("/api/trial-sheets/<int:sid>/measures/<int:bid>/<int:mi>")
+def delete_trial_measure(sid, bid, mi):
+    db, batch, s = _editable_sheet(sid)
+    db.execute(
+        "DELETE FROM trial_measures WHERE sheet_id=? AND block_id=? AND mark_index=?",
+        (sid, bid, mi))
+    db.commit()
+    batch2, payload = recompute_batch(s["batch_id"])
+    return jsonify(batch_to_dict(batch2, payload))
+
+
+@app.post("/api/trial-batches/<int:bid>/apply-corrections")
+def apply_batch_corrections(bid):
+    """把中位数建议修正(只含各色版平移)写入操作者勾选的**未锁定**色版。
+    已确认批次才可写入;既有试印 trials 与批次结果保持不变。"""
+    batch = load_batch_or_404(bid)
+    if batch["status"] != "confirmed":
+        abort(409, "请先确认批次(冻结测量与结果),再应用建议修正")
+    data = request.get_json(force=True) or {}
+    selected = set(data.get("block_ids") or [])
+    db = get_db()
+    snap = json.loads(batch["snapshot"])
+    payload = json.loads(batch["results"])
+    sugg = payload.get("suggestions", {})
+    applied, skipped = [], []
+    for sb in snap["blocks"]:
+        block_id = sb["id"]
+        if block_id not in selected:
+            continue
+        row = db.execute("SELECT * FROM blocks WHERE id=?", (block_id,)).fetchone()
+        if not row:
+            skipped.append({"block_id": block_id, "name": sb["name"], "reason": "色版已删除"})
+            continue
+        if row["locked_correction"]:
+            skipped.append({"block_id": block_id, "name": sb["name"], "reason": "修正已锁定"})
+            continue
+        sgb = sugg.get(str(block_id))
+        if not sgb:
+            skipped.append({"block_id": block_id, "name": sb["name"], "reason": "无中位数建议"})
+            continue
+        # 误差变换实测=设计+t(中位平移误差);在版的当前仿射平移量 u 上减去 t,
+        # 再反解为绕纸心旋转模型的 offset(旋转与缩放不动)。
+        tx, ty = sgb["tx"], sgb["ty"]
+        pw, ph = float(snap["paper_w"]), float(snap["paper_h"])
+        cx, cy = pw / 2, ph / 2
+        beta = math.radians(row["rotation"])
+        c0, s0 = math.cos(beta), math.sin(beta)
+        ux = cx - (c0 * cx - s0 * cy) + row["offset_x"] - tx
+        uy = cy - (s0 * cx + c0 * cy) + row["offset_y"] - ty
+        new_ox = r3(ux - cx + (c0 * cx - s0 * cy))
+        new_oy = r3(uy - cy + (s0 * cx + c0 * cy))
+        db.execute("UPDATE blocks SET offset_x=?,offset_y=? WHERE id=?",
+                   (new_ox, new_oy, block_id))
+        applied.append({"block_id": block_id, "name": sb["name"],
+                        "tx": r3(tx), "ty": r3(ty),
+                        "offset_x": new_ox, "offset_y": new_oy})
+    if not applied:
+        abort(400, "没有可写入的色版(未勾选、已锁定或无建议)")
+    log = json.loads(batch["applied_log"] or "[]")
+    log.append({"at": now_ts(),
+                "text": "应用建议修正:" + "；".join(
+                    f"{a['name']} Δ({a['tx']},{a['ty']}) → offset("
+                    f"{a['offset_x']},{a['offset_y']})" for a in applied)})
+    db.execute("UPDATE trial_batches SET applied_log=? WHERE id=?",
+               (json.dumps(log, ensure_ascii=False), bid))
+    db.commit()
+    return jsonify({"applied": applied, "skipped": skipped,
+                    "project": load_project_full(batch["project_id"])})
 
 
 # ---------------------------------------------------------------- 版序枚举 API

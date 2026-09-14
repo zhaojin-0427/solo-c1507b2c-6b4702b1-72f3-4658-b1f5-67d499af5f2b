@@ -14,6 +14,7 @@ function refreshAllPanels() {
   loadTrialList();
   loadPlanList();
   loadFlowList();
+  loadStabilityBatches();
   renderTransferList();
   App.issues = [];
   issueLayer = null;
@@ -44,6 +45,7 @@ async function openProject(id) {
   App.trialOverlay = false;
   RF.flows = []; RF.flow = null; RF.currentFlowId = null;
   RF.selectedStageId = null; RF.working = []; RF.maskImgs = {};
+  SB.batch = null; SB.batchId = null; SB.selectedSeq = null; SB.list = [];
   loadSketch();
   refreshAllPanels();
   initJigForProject();
@@ -98,6 +100,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   initPreviewTab();
   initRegisterTab();
   initTrialTab();
+  initStabilityTab();
   initPlanTab();
   initReductionTab();
   initJigTab();

@@ -119,6 +119,11 @@
 
   <!-- ⑤ 试印校准 -->
   <section id="tab-trial" class="tab-pane">
+    <div class="mode-bar">
+      <button class="mode-btn active" data-trial-mode="single">单张三点校准</button>
+      <button class="mode-btn" data-trial-mode="batch">多张试印稳定性分析</button>
+    </div>
+    <div id="trial-mode-single" class="mode-pane">
     <div class="side">
       <div class="panel">
         <h2>试印校准</h2>
@@ -137,13 +142,83 @@
         <div id="trial-result"></div>
         <div class="btn-row">
           <button id="btn-apply-corr">应用修正到该版</button>
-          <button id="btn-toggle-overlay">叠加修正前后轮廓</button>
+          <button id="btn-toggle-overlay" class="secondary">叠加修正前后轮廓</button>
         </div>
         <h3>试印记录</h3>
         <ul id="trial-list" class="plain-list"></ul>
       </div>
     </div>
     <div class="canvas-wrap"><canvas id="trial-canvas"></canvas></div>
+    </div>
+
+    <div id="trial-mode-batch" class="mode-pane" hidden>
+      <div class="side sb-side">
+        <div class="panel">
+          <h2>多张试印稳定性</h2>
+          <p class="hint">批次建立时从项目色版与套准标记建立<b>快照</b>;按印刷顺序收集 3～30 张试纸,
+            每张分色版录入三点实测坐标。系统分离印张共有的缩放/旋转与各版平移,检出漂移、突变、离群与漏测。</p>
+          <label>批次 <select id="sb-batch-select"></select></label>
+          <div class="btn-row">
+            <button id="btn-sb-new">＋ 新建批次(快照)</button>
+            <button id="btn-sb-del" class="danger">删除批次</button>
+          </div>
+          <div id="sb-meta" class="hint"></div>
+          <div class="btn-row" id="sb-batch-actions"></div>
+        </div>
+        <div class="panel" id="sb-sheet-panel">
+          <h2>试纸(印刷顺序)</h2>
+          <div class="btn-row">
+            <button id="btn-sb-add-sheet">＋ 追加试纸</button>
+          </div>
+          <ul id="sb-sheet-list" class="plain-list"></ul>
+        </div>
+        <div class="panel" id="sb-edit-panel"></div>
+      </div>
+      <div class="canvas-wrap sb-main">
+        <div class="sb-toolbar">
+          <label>视图
+            <select id="sb-view">
+              <option value="vector">误差矢量图</option>
+              <option value="preview">应用前后位置预览</option>
+            </select>
+          </label>
+          <label id="sb-metric-label">时间轴指标
+            <select id="sb-metric">
+              <option value="scale">共性缩放</option>
+              <option value="rot_deg">共性旋转 °</option>
+              <option value="tx">各版横向平移 mm</option>
+              <option value="ty">各版纵向平移 mm</option>
+              <option value="max_res">最大残差 mm</option>
+              <option value="misreg">最大版间套准差 mm</option>
+            </select>
+          </label>
+          <label>高亮色版
+            <select id="sb-block-filter"><option value="">全部</option></select>
+          </label>
+          <span id="sb-info" class="tag"></span>
+        </div>
+        <canvas id="sb-timeline-canvas"></canvas>
+        <canvas id="sb-canvas"></canvas>
+        <div class="sb-bottom">
+          <div class="panel sb-issues-panel">
+            <h3>异常清单(点选定位印张 / 色版 / 标记)</h3>
+            <ul id="sb-issues" class="plain-list"></ul>
+          </div>
+          <div class="panel sb-sugg-panel">
+            <h3>中位数建议修正与应用</h3>
+            <div id="sb-summary" class="hint"></div>
+            <table class="data-table" id="sb-sugg-table">
+              <thead><tr><th></th><th>色版</th><th>ΔX</th><th>ΔY</th><th>样本</th><th>锁定</th><th>状态</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <div class="btn-row">
+              <button id="btn-sb-apply">把勾选项写入未锁定色版</button>
+            </div>
+            <ul id="sb-log" class="plain-list"></ul>
+          </div>
+        </div>
+      </div>
+    </div>
   </section>
 
   <!-- ⑥ 版序优化 -->
@@ -304,6 +379,7 @@
 <script src="/static/js/editor.js"></script>
 <script src="/static/js/preview.js"></script>
 <script src="/static/js/trial.js"></script>
+<script src="/static/js/stability.js"></script>
 <script src="/static/js/plan.js"></script>
 <script src="/static/js/reduction.js"></script>
 <script src="/static/js/jig.js"></script>
