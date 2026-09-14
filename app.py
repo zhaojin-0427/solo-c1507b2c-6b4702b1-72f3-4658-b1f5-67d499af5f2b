@@ -733,9 +733,8 @@ def enumerate_orders(pid):
     n = len(blocks)
     if n < MIN_BLOCKS:
         abort(400, f"至少需要 {MIN_BLOCKS} 块色版")
+    # 工作坐标系与项目声明的纸面尺寸一致(横向即宽>高),不再交换宽高
     pw, ph = proj["paper_w"], proj["paper_h"]
-    if proj["orientation"] == "landscape":
-        pw, ph = ph, pw
     pair_err = rasterize_pair_errors(blocks, pw, ph)
 
     # blocks 已按 seq 排序;锁定的版固定在当前的印次位置,其余版排列其余位置
@@ -972,8 +971,6 @@ def create_flow(pid):
     if not block["regions"]:
         abort(400, "来源色版尚无封闭区域,请先在「区域勾勒」中勾勒色版区域")
     pw, ph = proj["paper_w"], proj["paper_h"]
-    if proj["orientation"] == "landscape":
-        pw, ph = ph, pw
     valid_ids = {r["id"] for r in block["regions"]}
     raw_sel = data.get("zone_ids")
     if raw_sel is None:
@@ -1285,13 +1282,17 @@ LOAD_LABELS = {"diag": "双向靠紧", "push_x": "横向推入", "push_y": "纵�
 
 def default_jig_config(proj):
     """按项目成品纸尺寸给出可直接评估的定位板初值:
-    裁切纸每边大 15mm,台面再大一圈,木版比成品区每边大 10mm。"""
-    pw, ph = proj["paper_w"], proj["paper_h"]
-    if proj["orientation"] == "landscape":
-        pw, ph = ph, pw
+    裁切纸每边大 15mm,台面再大一圈,木版比成品区每边大 10mm。
+    坐标与项目声明的纸面尺寸一致(横向项目即宽>高),不交换宽高。"""
+    pw, ph = float(proj["paper_w"]), float(proj["paper_h"])
     m = 15.0
     cut_w, cut_h = pw + 2 * m, ph + 2 * m
     px, py = 30.0, 30.0
+    # 侧槽默认选较长的邻边并尽量靠远端,以获得最长力臂
+    if pw >= ph:
+        side_edge, side_len = "bottom", cut_w
+    else:
+        side_edge, side_len = "left", cut_h
     return {
         "table_w": cut_w + 60, "table_h": cut_h + 60,
         "paper_x": px, "paper_y": py, "paper_w": cut_w, "paper_h": cut_h,
@@ -1300,8 +1301,7 @@ def default_jig_config(proj):
         "block_w": pw + 20, "block_h": ph + 20,
         "corner": {"edge": "bottom-left", "width": 40, "depth": 8,
                    "gap": 1.0, "locked": 0},
-        # 默认侧槽放在长边、尽量靠远端,以获得最长力臂
-        "side": {"edge": "left", "pos": round(ph + 2 * m - 22, 1),
+        "side": {"edge": side_edge, "pos": round(side_len - 22, 1),
                  "width": 30, "depth": 8, "gap": 1.0},
         "cut_error": 1.0, "max_skew_deg": 0.6, "lever_min_ratio": 0.4,
         "mark_inset": DEFAULT_MARK_INSET,

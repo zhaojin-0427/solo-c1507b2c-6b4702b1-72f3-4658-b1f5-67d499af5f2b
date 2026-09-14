@@ -63,10 +63,10 @@ function mixColor(below, ink, alpha) {
 /* ---------------- 几何 ---------------- */
 
 function paperSize() {
+  // 工作坐标系与项目声明的纸面尺寸一致:横向项目即宽>高,不交换宽高。
+  // 区域、套准标记、预览、减版、定位板全部在该系内,保证标记始终落在 0..w × 0..h。
   const p = App.project;
-  let w = p.paper_w, h = p.paper_h;
-  if (p.orientation === "landscape") [w, h] = [h, w];
-  return { w, h };
+  return { w: p.paper_w, h: p.paper_h };
 }
 
 /* 色版当前变换:绕纸面中心旋转后平移 */

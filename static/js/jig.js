@@ -52,10 +52,12 @@ const PRINT_DPI = 3.78;   // 96dpi:1mm ≈ 3.78px,打印时须选 100% 比例
 
 function defaultJigConfig() {
   const p = App.project;
-  let pw = p.paper_w, ph = p.paper_h;
-  if (p.orientation === "landscape") [pw, ph] = [ph, pw];
+  // 坐标与项目声明纸面一致(横向即宽>高),不交换宽高
+  const pw = +p.paper_w, ph = +p.paper_h;
   const m = 15;
   const cutW = pw + 2 * m, cutH = ph + 2 * m;
+  // 侧槽默认选较长的邻边并尽量靠远端,以获得最长力臂
+  const [sideEdge, sideLen] = pw >= ph ? ["bottom", cutW] : ["left", cutH];
   return {
     table_w: cutW + 60, table_h: cutH + 60,
     paper_x: 30, paper_y: 30, paper_w: cutW, paper_h: cutH,
@@ -63,7 +65,7 @@ function defaultJigConfig() {
     block_x: 30 + m - 10, block_y: 30 + m - 10,
     block_w: pw + 20, block_h: ph + 20,
     corner: { edge: "bottom-left", width: 40, depth: 8, gap: 1, locked: 0 },
-    side: { edge: "left", pos: +(ph + 2 * m - 22).toFixed(1), width: 30, depth: 8, gap: 1 },
+    side: { edge: sideEdge, pos: +(sideLen - 22).toFixed(1), width: 30, depth: 8, gap: 1 },
     cut_error: 1, max_skew_deg: 0.6, lever_min_ratio: 0.4,
     mark_inset: 8, load_mode: "diag",
   };
